@@ -1,0 +1,55 @@
+body {
+  margin: 0;
+  font-family: Arial;
+}
+
+.container {
+  max-width: 700px;
+  margin: auto;
+  padding: 20px;
+}
+
+.input-box {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+input, select {
+  padding: 8px;
+}
+
+button {
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.todo {
+  border: 1px solid #ccc;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.subtasks {
+  margin-top: 10px;
+  padding-left: 10px;
+}
+
+.category-bar {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  margin-bottom: 20px;
+}
+
+/* DESKTOP SIDEBAR */
+@media (min-width: 768px) {
+  .container {
+    display: flex;
+  }
+
+  .category-bar {
+    flex-direction: column;
+    width: 150px;
+  }
+}
