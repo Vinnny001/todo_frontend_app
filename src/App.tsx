@@ -1,9 +1,20 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import axios from "axios";
+import { Network } from "@capacitor/network";
+import {
+  LocalNotifications,
+  type PermissionStatus,
+} from "@capacitor/local-notifications";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Subtask = { id: number; task: string; completed: boolean };
+type Reminder = {
+  id: number;
+  daysBefore: number;
+  message: string | null;
+  enabled: boolean;
+};
 type Todo = {
   id: number;
   task: string;
@@ -11,15 +22,165 @@ type Todo = {
   dueDate: string | null;
   categoryId: number;
   subtasks: Subtask[];
+  reminders: Reminder[];
   favourited: boolean;
+  updatedAt?: string;
 };
-type Category = { id: number; name: string; color: string; locked?: boolean };
+type Category = {
+  id: number;
+  name: string;
+  color: string;
+  locked?: boolean;
+  updatedAt?: string;
+};
+type AppSettings = {
+  notifyDueTodayEnabled: boolean;
+  defaultReminderMessage: string;
+};
 type MenuItem = {
   label: string;
   icon: string;
   danger?: boolean;
   onClick: () => void;
 };
+
+// ─── Offline queue types ───────────────────────────────────────────────────────
+
+type TodoChanges = Partial<{
+  task: string;
+  completed: boolean;
+  dueDate: string | null;
+  categoryId: number;
+  favourited: boolean;
+}>;
+type CatChanges = Partial<{ name: string; color: string }>;
+
+type QueueAction =
+  | {
+      id: string;
+      kind: "createTodo";
+      tempId: number;
+      task: string;
+      dueDate: string | null;
+      categoryId: number;
+    }
+  | {
+      id: string;
+      kind: "updateTodo";
+      todoId: number;
+      changes: TodoChanges;
+      expectedUpdatedAt: string | null;
+    }
+  | { id: string; kind: "deleteTodo"; todoId: number }
+  | {
+      id: string;
+      kind: "createCategory";
+      tempId: number;
+      name: string;
+      color: string;
+    }
+  | {
+      id: string;
+      kind: "updateCategory";
+      catId: number;
+      changes: CatChanges;
+      expectedUpdatedAt: string | null;
+    }
+  | { id: string; kind: "deleteCategoryMove"; catId: number }
+  | { id: string; kind: "deleteCategoryWithTasks"; catId: number };
+
+type Conflict = {
+  id: string;
+  type: "todo" | "category";
+  entityId: number;
+  local: Todo | Category;
+  server: Todo | Category;
+  changes: TodoChanges | CatChanges;
+};
+
+// ─── Offline storage helpers ───────────────────────────────────────────────────
+
+const LS_TODOS = "todo_cache_todos";
+const LS_CATS = "todo_cache_categories";
+const LS_QUEUE = "todo_mutation_queue";
+const LS_CONFLICTS = "todo_conflicts";
+
+function loadLS<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function saveLS(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // storage unavailable — offline cache simply won't persist across restarts
+  }
+}
+
+const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+// ─── Local notification scheduling ─────────────────────────────────────────────
+
+async function scheduleAllReminders(todos: Todo[], settings: AppSettings) {
+  try {
+    const pending = await LocalNotifications.getPending();
+    if (pending.notifications.length) {
+      await LocalNotifications.cancel({
+        notifications: pending.notifications.map((n) => ({ id: n.id })),
+      });
+    }
+  } catch {
+    return; // not running under a native Capacitor shell — nothing to schedule
+  }
+
+  const now = Date.now();
+  const toSchedule: {
+    id: number;
+    title: string;
+    body: string;
+    schedule: { at: Date };
+  }[] = [];
+
+  for (const todo of todos) {
+    if (todo.completed || !todo.dueDate || todo.id < 0) continue;
+
+    const due = new Date(todo.dueDate);
+
+    for (const r of todo.reminders) {
+      if (!r.enabled) continue;
+
+      const notifyAt = new Date(due);
+      notifyAt.setDate(notifyAt.getDate() - r.daysBefore);
+      notifyAt.setHours(9, 0, 0, 0);
+      if (notifyAt.getTime() <= now) continue;
+
+      const template =
+        r.message || settings.defaultReminderMessage || 'Task "{task}" is due today!';
+
+      toSchedule.push({
+        id: r.id,
+        title:
+          r.daysBefore === 0
+            ? "Task due today"
+            : `Task due in ${r.daysBefore} day${r.daysBefore === 1 ? "" : "s"}`,
+        body: template.replace("{task}", todo.task),
+        schedule: { at: notifyAt },
+      });
+    }
+  }
+
+  if (toSchedule.length) {
+    try {
+      await LocalNotifications.schedule({ notifications: toSchedule });
+    } catch {
+      // scheduling failed — nothing actionable client-side
+    }
+  }
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -134,8 +295,12 @@ function StarButton({
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [todos, setTodos] = useState<Todo[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
+  const [todos, setTodos] = useState<Todo[]>(() =>
+    loadLS<Todo[]>(LS_TODOS, []),
+  );
+  const [categories, setCategories] = useState<Category[]>(() =>
+    loadLS<Category[]>(LS_CATS, []),
+  );
   const [activeCatId, setActiveCatId] = useState<number | null>(null);
   const [statusFilter, setStatusFilter] = useState<
     "all" | "pending" | "completed"
@@ -191,6 +356,13 @@ export default function App() {
   const [catName, setCatName] = useState("");
   const [catColor, setCatColor] = useState(PRESET_COLORS[0]);
 
+  // Delete-category modal (choose: delete entirely vs move tasks to My Tasks)
+  const [deleteCatTarget, setDeleteCatTarget] = useState<Category | null>(
+    null,
+  );
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressFired = useRef(false);
+
   // Todo expand
   const [expandedTodos, setExpandedTodos] = useState<Set<number>>(new Set());
   const [subtaskInput, setSubtaskInput] = useState<{ [id: number]: string }>(
@@ -206,6 +378,51 @@ export default function App() {
   // Pull to refresh
   const [refreshing, setRefreshing] = useState(false);
   const startY = useRef(0);
+
+  // ── Offline / sync state ─────────────────────────────────────────────────
+
+  const [isOnline, setIsOnline] = useState(true);
+  const [queue, setQueue] = useState<QueueAction[]>(() =>
+    loadLS<QueueAction[]>(LS_QUEUE, []),
+  );
+  const [conflicts, setConflicts] = useState<Conflict[]>(() =>
+    loadLS<Conflict[]>(LS_CONFLICTS, []),
+  );
+  const [syncing, setSyncing] = useState(false);
+
+  const todosRef = useRef<Todo[]>([]);
+  const categoriesRef = useRef<Category[]>([]);
+  const queueRef = useRef<QueueAction[]>([]);
+  const syncingRef = useRef(false);
+  const nextTempIdRef = useRef(-1);
+
+  useEffect(() => {
+    todosRef.current = todos;
+    saveLS(LS_TODOS, todos);
+  }, [todos]);
+  useEffect(() => {
+    categoriesRef.current = categories;
+    saveLS(LS_CATS, categories);
+  }, [categories]);
+  useEffect(() => {
+    queueRef.current = queue;
+    saveLS(LS_QUEUE, queue);
+  }, [queue]);
+  useEffect(() => {
+    saveLS(LS_CONFLICTS, conflicts);
+  }, [conflicts]);
+
+  const nextTempId = () => nextTempIdRef.current--;
+
+  // ── Notification settings ────────────────────────────────────────────────
+
+  const [settings, setSettings] = useState<AppSettings>({
+    notifyDueTodayEnabled: true,
+    defaultReminderMessage: 'Task "{task}" is due today!',
+  });
+  const [settingsModal, setSettingsModal] = useState(false);
+  const [notifPermission, setNotifPermission] =
+    useState<PermissionStatus["display"]>("prompt");
 
   // ── Data ──────────────────────────────────────────────────────────────────
 
@@ -226,9 +443,368 @@ export default function App() {
     });
   }, []);
 
+  // Todos/categories start from cache (see useState initializers above);
+  // refresh from the network on mount when available.
   useEffect(() => {
-    fetchAll();
+    fetchAll().catch(() => {
+      // offline at startup — cached data (if any) stays on screen
+    });
+
+    axios
+      .get<AppSettings>(`${API}/settings`)
+      .then((r) => setSettings(r.data))
+      .catch(() => {});
   }, [fetchAll]);
+
+  // ── Network status + sync ────────────────────────────────────────────────
+
+  useEffect(() => {
+    let listenerHandle: { remove: () => void } | undefined;
+
+    (async () => {
+      try {
+        const status = await Network.getStatus();
+        setIsOnline(status.connected);
+      } catch {
+        setIsOnline(navigator.onLine);
+      }
+      try {
+        const l = await Network.addListener("networkStatusChange", (s) => {
+          setIsOnline(s.connected);
+        });
+        listenerHandle = l;
+      } catch {
+        const on = () => setIsOnline(true);
+        const off = () => setIsOnline(false);
+        window.addEventListener("online", on);
+        window.addEventListener("offline", off);
+        listenerHandle = {
+          remove: () => {
+            window.removeEventListener("online", on);
+            window.removeEventListener("offline", off);
+          },
+        };
+      }
+    })();
+
+    return () => listenerHandle?.remove();
+  }, []);
+
+  function remapAction(
+    action: QueueAction,
+    idMap: Record<number, number>,
+  ): QueueAction {
+    const r = (id: number) => idMap[id] ?? id;
+    switch (action.kind) {
+      case "createTodo":
+        return { ...action, categoryId: r(action.categoryId) };
+      case "updateTodo":
+        return {
+          ...action,
+          todoId: r(action.todoId),
+          changes:
+            action.changes.categoryId !== undefined
+              ? { ...action.changes, categoryId: r(action.changes.categoryId) }
+              : action.changes,
+        };
+      case "deleteTodo":
+        return { ...action, todoId: r(action.todoId) };
+      case "updateCategory":
+        return { ...action, catId: r(action.catId) };
+      case "deleteCategoryMove":
+        return { ...action, catId: r(action.catId) };
+      case "deleteCategoryWithTasks":
+        return { ...action, catId: r(action.catId) };
+      default:
+        return action;
+    }
+  }
+
+  const addConflict = (c: Omit<Conflict, "id">) =>
+    setConflicts((p) => [...p, { ...c, id: uid() }]);
+
+  const resolveConflictKeepMine = async (c: Conflict) => {
+    try {
+      if (c.type === "todo") {
+        const res = await axios.patch<Todo>(
+          `${API}/todos/${c.entityId}`,
+          c.changes,
+        );
+        setTodos((p) => p.map((t) => (t.id === c.entityId ? res.data : t)));
+      } else {
+        const res = await axios.patch<Category>(
+          `${API}/categories/${c.entityId}`,
+          c.changes,
+        );
+        setCategories((p) =>
+          p.map((cat) => (cat.id === c.entityId ? res.data : cat)),
+        );
+      }
+    } finally {
+      setConflicts((p) => p.filter((x) => x.id !== c.id));
+    }
+  };
+
+  const resolveConflictKeepServer = (c: Conflict) => {
+    if (c.type === "todo") {
+      setTodos((p) =>
+        p.map((t) => (t.id === c.entityId ? (c.server as Todo) : t)),
+      );
+    } else {
+      setCategories((p) =>
+        p.map((cat) => (cat.id === c.entityId ? (c.server as Category) : cat)),
+      );
+    }
+    setConflicts((p) => p.filter((x) => x.id !== c.id));
+  };
+
+  // ── Local notifications ──────────────────────────────────────────────────
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const status = await LocalNotifications.checkPermissions();
+        if (status.display === "granted" || status.display === "denied") {
+          setNotifPermission(status.display);
+          return;
+        }
+        const req = await LocalNotifications.requestPermissions();
+        setNotifPermission(req.display);
+      } catch {
+        // not running under Capacitor (e.g. plain browser dev) — skip silently
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (notifPermission !== "granted") return;
+    scheduleAllReminders(todos, settings).catch(() => {});
+  }, [todos, settings, notifPermission]);
+
+  // ── Notification settings ────────────────────────────────────────────────
+
+  const updateSettings = async (changes: Partial<AppSettings>) => {
+    setSettings((p) => ({ ...p, ...changes }));
+    if (!isOnline) return;
+    try {
+      const res = await axios.patch<AppSettings>(`${API}/settings`, changes);
+      setSettings(res.data);
+    } catch {
+      // will simply retry from server state on next successful fetch
+    }
+  };
+
+  // ── Per-task reminders (online-only) ─────────────────────────────────────
+
+  const [reminderDaysInput, setReminderDaysInput] = useState<{
+    [id: number]: string;
+  }>({});
+  const [reminderMsgInput, setReminderMsgInput] = useState<{
+    [id: number]: string;
+  }>({});
+
+  const addReminder = async (todoId: number) => {
+    if (!isOnline || todoId < 0) return;
+    const days = parseInt(reminderDaysInput[todoId] ?? "0", 10);
+    if (Number.isNaN(days) || days < 0) return;
+    const message = reminderMsgInput[todoId]?.trim() || undefined;
+
+    const res = await axios.post<Todo>(`${API}/todos/${todoId}/reminders`, {
+      daysBefore: days,
+      message,
+    });
+    setTodos((p) => p.map((t) => (t.id === todoId ? res.data : t)));
+    setReminderDaysInput((p) => ({ ...p, [todoId]: "" }));
+    setReminderMsgInput((p) => ({ ...p, [todoId]: "" }));
+  };
+
+  const toggleReminder = async (
+    todoId: number,
+    reminderId: number,
+    enabled: boolean,
+  ) => {
+    if (!isOnline) return;
+    const res = await axios.patch<Todo>(
+      `${API}/todos/${todoId}/reminders/${reminderId}`,
+      { enabled: !enabled },
+    );
+    setTodos((p) => p.map((t) => (t.id === todoId ? res.data : t)));
+  };
+
+  const editReminderMessage = async (
+    todoId: number,
+    reminderId: number,
+    message: string,
+  ) => {
+    if (!isOnline) return;
+    const res = await axios.patch<Todo>(
+      `${API}/todos/${todoId}/reminders/${reminderId}`,
+      { message },
+    );
+    setTodos((p) => p.map((t) => (t.id === todoId ? res.data : t)));
+  };
+
+  const deleteReminder = async (todoId: number, reminderId: number) => {
+    if (!isOnline) return;
+    const res = await axios.delete<Todo>(
+      `${API}/todos/${todoId}/reminders/${reminderId}`,
+    );
+    setTodos((p) => p.map((t) => (t.id === todoId ? res.data : t)));
+  };
+
+  async function syncQueue() {
+    if (syncingRef.current) return;
+    if (queueRef.current.length === 0) return;
+    syncingRef.current = true;
+    setSyncing(true);
+
+    const idMap: Record<number, number> = {};
+    const remaining: QueueAction[] = [];
+    let stop = false;
+
+    for (const raw of queueRef.current) {
+      if (stop) {
+        remaining.push(raw);
+        continue;
+      }
+
+      const action = remapAction(raw, idMap);
+
+      try {
+        if (action.kind === "createTodo") {
+          const res = await axios.post<Todo>(`${API}/todos`, {
+            task: action.task,
+            dueDate: action.dueDate,
+            categoryId: action.categoryId,
+          });
+          idMap[action.tempId] = res.data.id;
+          setTodos((p) =>
+            p.map((t) => (t.id === action.tempId ? res.data : t)),
+          );
+        } else if (action.kind === "updateTodo") {
+          try {
+            const res = await axios.patch<Todo>(
+              `${API}/todos/${action.todoId}`,
+              { ...action.changes, expectedUpdatedAt: action.expectedUpdatedAt },
+            );
+            setTodos((p) =>
+              p.map((t) => (t.id === action.todoId ? res.data : t)),
+            );
+          } catch (err) {
+            const status = axios.isAxiosError(err)
+              ? err.response?.status
+              : undefined;
+            if (status === 409 && axios.isAxiosError(err)) {
+              const local = todosRef.current.find(
+                (t) => t.id === action.todoId,
+              );
+              if (local) {
+                addConflict({
+                  type: "todo",
+                  entityId: action.todoId,
+                  local,
+                  server: err.response!.data.server,
+                  changes: action.changes,
+                });
+              }
+            } else if (status === 404) {
+              setTodos((p) => p.filter((t) => t.id !== action.todoId));
+            } else {
+              throw err;
+            }
+          }
+        } else if (action.kind === "deleteTodo") {
+          try {
+            await axios.delete(`${API}/todos/${action.todoId}`);
+          } catch (err) {
+            if (!axios.isAxiosError(err) || err.response?.status !== 404) {
+              throw err;
+            }
+          }
+        } else if (action.kind === "createCategory") {
+          const res = await axios.post<Category>(`${API}/categories`, {
+            name: action.name,
+            color: action.color,
+          });
+          idMap[action.tempId] = res.data.id;
+          setCategories((p) =>
+            p.map((c) => (c.id === action.tempId ? res.data : c)),
+          );
+        } else if (action.kind === "updateCategory") {
+          try {
+            const res = await axios.patch<Category>(
+              `${API}/categories/${action.catId}`,
+              { ...action.changes, expectedUpdatedAt: action.expectedUpdatedAt },
+            );
+            setCategories((p) =>
+              p.map((c) => (c.id === action.catId ? res.data : c)),
+            );
+          } catch (err) {
+            const status = axios.isAxiosError(err)
+              ? err.response?.status
+              : undefined;
+            if (status === 409 && axios.isAxiosError(err)) {
+              const local = categoriesRef.current.find(
+                (c) => c.id === action.catId,
+              );
+              if (local) {
+                addConflict({
+                  type: "category",
+                  entityId: action.catId,
+                  local,
+                  server: err.response!.data.server,
+                  changes: action.changes,
+                });
+              }
+            } else if (status === 404) {
+              setCategories((p) => p.filter((c) => c.id !== action.catId));
+            } else {
+              throw err;
+            }
+          }
+        } else if (action.kind === "deleteCategoryMove") {
+          try {
+            await axios.delete(`${API}/categories/${action.catId}`);
+          } catch (err) {
+            if (
+              !axios.isAxiosError(err) ||
+              (err.response?.status !== 404 && err.response?.status !== 403)
+            ) {
+              throw err;
+            }
+          }
+        } else if (action.kind === "deleteCategoryWithTasks") {
+          try {
+            await axios.delete(`${API}/categories/${action.catId}/with-tasks`);
+          } catch (err) {
+            if (
+              !axios.isAxiosError(err) ||
+              (err.response?.status !== 404 && err.response?.status !== 403)
+            ) {
+              throw err;
+            }
+          }
+        }
+      } catch {
+        // genuine network failure — stop draining, keep remaining actions queued
+        stop = true;
+        remaining.push(raw);
+      }
+    }
+
+    setQueue(remaining);
+    syncingRef.current = false;
+    setSyncing(false);
+
+    if (!stop) {
+      await fetchAll().catch(() => {});
+    }
+  }
+
+  useEffect(() => {
+    if (isOnline) syncQueue();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOnline]);
 
   const handleTouchStart = (e: React.TouchEvent) => {
     startY.current = e.touches[0].clientY;
@@ -285,60 +861,219 @@ export default function App() {
   })();
   // ── Todo CRUD ─────────────────────────────────────────────────────────────
 
+  const optimisticTodo = (
+    id: number,
+    task: string,
+    dueDate: string | null,
+    categoryId: number,
+  ): Todo => ({
+    id,
+    task,
+    completed: false,
+    dueDate,
+    categoryId,
+    subtasks: [],
+    reminders: [],
+    favourited: false,
+  });
+
   const addTodo = async (catOverride?: number) => {
     if (!task.trim()) return;
     const targetCat = catOverride ?? newCatId;
     if (targetCat === FAVOURITE_ID) return; // guard
-    const res = await axios.post<Todo>(`${API}/todos`, {
-      task,
+    const payload = {
+      task: task.trim(),
       dueDate: dueDate || null,
       categoryId: targetCat,
-    });
-    setTodos((p) => [...p, res.data]);
+    };
+
+    if (!isOnline) {
+      const tempId = nextTempId();
+      setTodos((p) => [
+        ...p,
+        optimisticTodo(tempId, payload.task, payload.dueDate, targetCat),
+      ]);
+      setQueue((p) => [
+        ...p,
+        { id: uid(), kind: "createTodo", tempId, ...payload },
+      ]);
+      setTask("");
+      setDueDate("");
+      return;
+    }
+
+    try {
+      const res = await axios.post<Todo>(`${API}/todos`, payload);
+      setTodos((p) => [...p, res.data]);
+    } catch (err) {
+      if (!axios.isAxiosError(err) || !err.response) {
+        const tempId = nextTempId();
+        setTodos((p) => [
+          ...p,
+          optimisticTodo(tempId, payload.task, payload.dueDate, targetCat),
+        ]);
+        setQueue((p) => [
+          ...p,
+          { id: uid(), kind: "createTodo", tempId, ...payload },
+        ]);
+      } else {
+        throw err;
+      }
+    }
     setTask("");
     setDueDate("");
   };
 
   const addTodoInCat = async (t: string, catId: number) => {
     if (!t.trim() || catId === FAVOURITE_ID) return;
-    const res = await axios.post<Todo>(`${API}/todos`, {
-      task: t,
-      categoryId: catId,
-    });
-    setTodos((p) => [...p, res.data]);
+    const payload = { task: t.trim(), dueDate: null, categoryId: catId };
+
+    if (!isOnline) {
+      const tempId = nextTempId();
+      setTodos((p) => [
+        ...p,
+        optimisticTodo(tempId, payload.task, null, catId),
+      ]);
+      setQueue((p) => [
+        ...p,
+        { id: uid(), kind: "createTodo", tempId, ...payload },
+      ]);
+      return;
+    }
+
+    try {
+      const res = await axios.post<Todo>(`${API}/todos`, payload);
+      setTodos((p) => [...p, res.data]);
+    } catch (err) {
+      if (!axios.isAxiosError(err) || !err.response) {
+        const tempId = nextTempId();
+        setTodos((p) => [
+          ...p,
+          optimisticTodo(tempId, payload.task, null, catId),
+        ]);
+        setQueue((p) => [
+          ...p,
+          { id: uid(), kind: "createTodo", tempId, ...payload },
+        ]);
+      } else {
+        throw err;
+      }
+    }
   };
 
-  const toggleTodo = async (id: number, completed: boolean) => {
-    const res = await axios.patch<Todo>(`${API}/todos/${id}`, {
-      completed: !completed,
-    });
-    setTodos((p) => p.map((t) => (t.id === id ? res.data : t)));
+  // Routes every todo field edit through the offline queue + conflict check
+  const updateTodoFields = async (id: number, changes: TodoChanges) => {
+    const current = todosRef.current.find((t) => t.id === id);
+    if (!current) return;
+    const expectedUpdatedAt = current.updatedAt ?? null;
+
+    setTodos((p) => p.map((t) => (t.id === id ? { ...t, ...changes } : t)));
+
+    if (id < 0) {
+      // still-unsynced offline-created todo — fold into its pending create
+      setQueue((p) =>
+        p.map((a) =>
+          a.kind === "createTodo" && a.tempId === id
+            ? {
+                ...a,
+                task: changes.task ?? a.task,
+                dueDate:
+                  changes.dueDate !== undefined ? changes.dueDate : a.dueDate,
+                categoryId: changes.categoryId ?? a.categoryId,
+              }
+            : a,
+        ),
+      );
+      return;
+    }
+
+    if (!isOnline) {
+      setQueue((p) => [
+        ...p,
+        { id: uid(), kind: "updateTodo", todoId: id, changes, expectedUpdatedAt },
+      ]);
+      return;
+    }
+
+    try {
+      const res = await axios.patch<Todo>(`${API}/todos/${id}`, {
+        ...changes,
+        expectedUpdatedAt,
+      });
+      setTodos((p) => p.map((t) => (t.id === id ? res.data : t)));
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 409) {
+        addConflict({
+          type: "todo",
+          entityId: id,
+          local: { ...current, ...changes },
+          server: err.response.data.server,
+          changes,
+        });
+      } else if (!axios.isAxiosError(err) || !err.response) {
+        setQueue((p) => [
+          ...p,
+          { id: uid(), kind: "updateTodo", todoId: id, changes, expectedUpdatedAt },
+        ]);
+      } else {
+        throw err;
+      }
+    }
   };
 
-  const toggleFavourite = async (id: number) => {
-    const res = await axios.patch<Todo>(`${API}/todos/${id}/favourite`);
-    setTodos((p) => p.map((t) => (t.id === id ? res.data : t)));
+  const toggleTodo = (id: number, completed: boolean) =>
+    updateTodoFields(id, { completed: !completed });
+
+  const toggleFavourite = (id: number) => {
+    const current = todosRef.current.find((t) => t.id === id);
+    if (!current) return;
+    return updateTodoFields(id, { favourited: !current.favourited });
   };
 
   const deleteTodo = async (id: number) => {
-    await axios.delete(`${API}/todos/${id}`);
     setTodos((p) => p.filter((t) => t.id !== id));
     setExpandedTodos((s) => {
       const n = new Set(s);
       n.delete(id);
       return n;
     });
+
+    if (id < 0) {
+      setQueue((p) =>
+        p.filter(
+          (a) =>
+            !(a.kind === "createTodo" && a.tempId === id) &&
+            !(a.kind === "updateTodo" && a.todoId === id),
+        ),
+      );
+      return;
+    }
+
+    if (!isOnline) {
+      setQueue((p) => [
+        ...p.filter((a) => !(a.kind === "updateTodo" && a.todoId === id)),
+        { id: uid(), kind: "deleteTodo", todoId: id },
+      ]);
+      return;
+    }
+
+    try {
+      await axios.delete(`${API}/todos/${id}`);
+    } catch (err) {
+      if (!axios.isAxiosError(err) || !err.response) {
+        setQueue((p) => [...p, { id: uid(), kind: "deleteTodo", todoId: id }]);
+      }
+    }
   };
 
   const saveEditTodo = async (id: number) => {
     if (!editTask.trim()) return;
     const catId = editCatIdState === FAVOURITE_ID ? 1 : editCatIdState;
-    const res = await axios.patch<Todo>(`${API}/todos/${id}`, {
-      task: editTask,
+    await updateTodoFields(id, {
+      task: editTask.trim(),
       dueDate: editDue || null,
       categoryId: catId,
     });
-    setTodos((p) => p.map((t) => (t.id === id ? res.data : t)));
     setEditingTodo(null);
   };
 
@@ -349,17 +1084,16 @@ export default function App() {
     setEditCatIdState(todo.categoryId === FAVOURITE_ID ? 1 : todo.categoryId);
   };
 
-  const moveTodoCat = async (id: number, categoryId: number) => {
+  const moveTodoCat = (id: number, categoryId: number) => {
     if (categoryId === FAVOURITE_ID) return; // star logic only
-    const res = await axios.patch<Todo>(`${API}/todos/${id}`, { categoryId });
-    setTodos((p) => p.map((t) => (t.id === id ? res.data : t)));
+    return updateTodoFields(id, { categoryId });
   };
 
-  // ── Subtasks ──────────────────────────────────────────────────────────────
+  // ── Subtasks & reminders (online-only — see offline banner) ────────────────
 
   const addSubtask = async (todoId: number) => {
     const t = subtaskInput[todoId]?.trim();
-    if (!t) return;
+    if (!t || !isOnline || todoId < 0) return;
     const res = await axios.post<Todo>(`${API}/todos/${todoId}/subtasks`, {
       task: t,
     });
@@ -372,6 +1106,7 @@ export default function App() {
     sid: number,
     completed: boolean,
   ) => {
+    if (!isOnline) return;
     const res = await axios.patch<Todo>(`${API}/todos/${tid}/subtasks/${sid}`, {
       completed: !completed,
     });
@@ -379,6 +1114,7 @@ export default function App() {
   };
 
   const deleteSubtask = async (tid: number, sid: number) => {
+    if (!isOnline) return;
     const res = await axios.delete<Todo>(`${API}/todos/${tid}/subtasks/${sid}`);
     setTodos((p) => p.map((t) => (t.id === tid ? res.data : t)));
   };
@@ -400,29 +1136,196 @@ export default function App() {
 
   const saveCat = async () => {
     if (!catName.trim()) return;
+    const name = catName.trim();
+    const color = catColor;
+
     if (editCat) {
-      const res = await axios.patch<Category>(
-        `${API}/categories/${editCat.id}`,
-        { name: catName, color: catColor },
+      const catId = editCat.id;
+      const changes: CatChanges = { name, color };
+      const current = categoriesRef.current.find((c) => c.id === catId);
+      const expectedUpdatedAt = current?.updatedAt ?? null;
+
+      setCategories((p) =>
+        p.map((c) => (c.id === catId ? { ...c, ...changes } : c)),
       );
-      setCategories((p) => p.map((c) => (c.id === editCat.id ? res.data : c)));
+      setCatModal(false);
+
+      if (catId < 0) {
+        setQueue((p) =>
+          p.map((a) =>
+            a.kind === "createCategory" && a.tempId === catId
+              ? { ...a, name, color }
+              : a,
+          ),
+        );
+        return;
+      }
+
+      if (!isOnline) {
+        setQueue((p) => [
+          ...p,
+          { id: uid(), kind: "updateCategory", catId, changes, expectedUpdatedAt },
+        ]);
+        return;
+      }
+
+      try {
+        const res = await axios.patch<Category>(`${API}/categories/${catId}`, {
+          ...changes,
+          expectedUpdatedAt,
+        });
+        setCategories((p) => p.map((c) => (c.id === catId ? res.data : c)));
+      } catch (err) {
+        if (axios.isAxiosError(err) && err.response?.status === 409 && current) {
+          addConflict({
+            type: "category",
+            entityId: catId,
+            local: { ...current, ...changes },
+            server: err.response.data.server,
+            changes,
+          });
+        } else if (!axios.isAxiosError(err) || !err.response) {
+          setQueue((p) => [
+            ...p,
+            { id: uid(), kind: "updateCategory", catId, changes, expectedUpdatedAt },
+          ]);
+        }
+      }
     } else {
-      const res = await axios.post<Category>(`${API}/categories`, {
-        name: catName,
-        color: catColor,
-      });
-      setCategories((p) => [...p, res.data]);
+      setCatModal(false);
+
+      if (!isOnline) {
+        const tempId = nextTempId();
+        setCategories((p) => [
+          ...p,
+          { id: tempId, name, color, locked: false },
+        ]);
+        setQueue((p) => [
+          ...p,
+          { id: uid(), kind: "createCategory", tempId, name, color },
+        ]);
+        return;
+      }
+
+      try {
+        const res = await axios.post<Category>(`${API}/categories`, {
+          name,
+          color,
+        });
+        setCategories((p) => [...p, res.data]);
+      } catch (err) {
+        if (!axios.isAxiosError(err) || !err.response) {
+          const tempId = nextTempId();
+          setCategories((p) => [
+            ...p,
+            { id: tempId, name, color, locked: false },
+          ]);
+          setQueue((p) => [
+            ...p,
+            { id: uid(), kind: "createCategory", tempId, name, color },
+          ]);
+        } else {
+          throw err;
+        }
+      }
     }
-    setCatModal(false);
   };
 
-  const deleteCat = async (id: number) => {
-    if (!window.confirm("Delete this category? Tasks will move to My Tasks."))
-      return;
-    await axios.delete(`${API}/categories/${id}`);
+  // Move tasks to "My Tasks" then delete the category
+  const deleteCatMoveTasks = async (id: number) => {
     setCategories((p) => p.filter((c) => c.id !== id));
+    setTodos((p) =>
+      p.map((t) => (t.categoryId === id ? { ...t, categoryId: 1 } : t)),
+    );
     if (activeCatId === id) setActiveCatId(null);
-    await fetchAll();
+    setDeleteCatTarget(null);
+
+    if (id < 0) {
+      setQueue((p) =>
+        p.filter(
+          (a) =>
+            !(a.kind === "createCategory" && a.tempId === id) &&
+            !(a.kind === "updateCategory" && a.catId === id),
+        ),
+      );
+      return;
+    }
+
+    if (!isOnline) {
+      setQueue((p) => [
+        ...p.filter((a) => !(a.kind === "updateCategory" && a.catId === id)),
+        { id: uid(), kind: "deleteCategoryMove", catId: id },
+      ]);
+      return;
+    }
+
+    try {
+      await axios.delete(`${API}/categories/${id}`);
+      await fetchAll();
+    } catch (err) {
+      if (!axios.isAxiosError(err) || !err.response) {
+        setQueue((p) => [
+          ...p,
+          { id: uid(), kind: "deleteCategoryMove", catId: id },
+        ]);
+      }
+    }
+  };
+
+  // Delete the category along with all of its tasks
+  const deleteCatWithTasks = async (id: number) => {
+    setCategories((p) => p.filter((c) => c.id !== id));
+    setTodos((p) => p.filter((t) => t.categoryId !== id));
+    if (activeCatId === id) setActiveCatId(null);
+    setDeleteCatTarget(null);
+
+    if (id < 0) {
+      setQueue((p) =>
+        p.filter(
+          (a) =>
+            !(a.kind === "createCategory" && a.tempId === id) &&
+            !(a.kind === "updateCategory" && a.catId === id),
+        ),
+      );
+      return;
+    }
+
+    if (!isOnline) {
+      setQueue((p) => [
+        ...p.filter((a) => !(a.kind === "updateCategory" && a.catId === id)),
+        { id: uid(), kind: "deleteCategoryWithTasks", catId: id },
+      ]);
+      return;
+    }
+
+    try {
+      await axios.delete(`${API}/categories/${id}/with-tasks`);
+      await fetchAll();
+    } catch (err) {
+      if (!axios.isAxiosError(err) || !err.response) {
+        setQueue((p) => [
+          ...p,
+          { id: uid(), kind: "deleteCategoryWithTasks", catId: id },
+        ]);
+      }
+    }
+  };
+
+  // Long-press handling for mobile category chips
+  const startLongPress = (cat: Category) => {
+    if (cat.locked) return;
+    longPressFired.current = false;
+    longPressTimer.current = setTimeout(() => {
+      longPressFired.current = true;
+      if (navigator.vibrate) navigator.vibrate(30);
+      setDeleteCatTarget(cat);
+    }, 550);
+  };
+  const cancelLongPress = () => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
   };
 
   // ── UI helpers ────────────────────────────────────────────────────────────
@@ -518,6 +1421,150 @@ export default function App() {
         </div>
       )}
 
+      {/* Delete-category modal */}
+      {deleteCatTarget && (
+        <div
+          className="modal-overlay"
+          onClick={() => setDeleteCatTarget(null)}
+        >
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-title">
+              Delete "{deleteCatTarget.name}"?
+            </h3>
+            <p className="modal-desc">
+              What should happen to the tasks in this category?
+            </p>
+            <div className="modal-actions modal-actions-col">
+              <button
+                className="btn-primary"
+                onClick={() => deleteCatMoveTasks(deleteCatTarget.id)}
+              >
+                Move tasks to My Tasks
+              </button>
+              <button
+                className="btn-danger"
+                onClick={() => deleteCatWithTasks(deleteCatTarget.id)}
+              >
+                Delete category and its tasks
+              </button>
+              <button
+                className="btn-ghost"
+                onClick={() => setDeleteCatTarget(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Notification settings modal */}
+      {settingsModal && (
+        <div
+          className="modal-overlay"
+          onClick={() => setSettingsModal(false)}
+        >
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-title">Notification Settings</h3>
+
+            <label className="settings-row">
+              <span>Notify me when a task is due today</span>
+              <input
+                type="checkbox"
+                checked={settings.notifyDueTodayEnabled}
+                onChange={(e) =>
+                  updateSettings({ notifyDueTodayEnabled: e.target.checked })
+                }
+              />
+            </label>
+
+            <p className="modal-desc" style={{ marginTop: 12 }}>
+              Default reminder message (use {"{task}"} for the task name)
+            </p>
+            <input
+              className="modal-input"
+              value={settings.defaultReminderMessage}
+              onChange={(e) =>
+                setSettings((p) => ({
+                  ...p,
+                  defaultReminderMessage: e.target.value,
+                }))
+              }
+              onBlur={(e) =>
+                updateSettings({ defaultReminderMessage: e.target.value })
+              }
+            />
+
+            {notifPermission !== "granted" && (
+              <p className="modal-desc" style={{ color: "var(--danger)" }}>
+                Notifications are {notifPermission} on this device — enable
+                them in system settings to receive reminders.
+              </p>
+            )}
+
+            <div className="modal-actions">
+              <button
+                className="btn-primary"
+                onClick={() => setSettingsModal(false)}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Conflict resolution modal */}
+      {conflicts.length > 0 && (
+        <div className="modal-overlay">
+          <div className="modal-box">
+            <h3 className="modal-title">Resolve sync conflicts</h3>
+            <p className="modal-desc">
+              These changed both on this device (while offline) and elsewhere
+              since you were last online. Choose which version to keep.
+            </p>
+            <div className="conflict-list">
+              {conflicts.map((c) => {
+                const localLabel =
+                  c.type === "todo"
+                    ? (c.local as Todo).task
+                    : (c.local as Category).name;
+                const serverLabel =
+                  c.type === "todo"
+                    ? (c.server as Todo).task
+                    : (c.server as Category).name;
+                return (
+                  <div key={c.id} className="conflict-item">
+                    <div className="conflict-item-title">
+                      {c.type === "todo" ? "Task" : "Category"}: "
+                      {serverLabel}"
+                    </div>
+                    <div className="conflict-item-versions">
+                      <span>Yours: "{localLabel}"</span>
+                      <span>Server: "{serverLabel}"</span>
+                    </div>
+                    <div className="modal-actions">
+                      <button
+                        className="btn-ghost"
+                        onClick={() => resolveConflictKeepServer(c)}
+                      >
+                        Keep server's
+                      </button>
+                      <button
+                        className="btn-primary"
+                        onClick={() => resolveConflictKeepMine(c)}
+                      >
+                        Keep mine
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div
         className="layout"
         onTouchStart={handleTouchStart}
@@ -536,13 +1583,22 @@ export default function App() {
             <>
               <div className="sidebar-header">
                 <span className="sidebar-logo">✦ Lists</span>
-                <button
-                  className="add-cat-icon"
-                  onClick={openNewCat}
-                  title="New category"
-                >
-                  +
-                </button>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button
+                    className="add-cat-icon"
+                    onClick={() => setSettingsModal(true)}
+                    title="Notification settings"
+                  >
+                    🔔
+                  </button>
+                  <button
+                    className="add-cat-icon"
+                    onClick={openNewCat}
+                    title="New category"
+                  >
+                    +
+                  </button>
+                </div>
               </div>
 
               <nav className="sidebar-nav">
@@ -622,7 +1678,7 @@ export default function App() {
                                 label: "Delete category",
                                 icon: "✕",
                                 danger: true,
-                                onClick: () => deleteCat(cat.id),
+                                onClick: () => setDeleteCatTarget(cat),
                               },
                             ]}
                           />
@@ -770,6 +1826,23 @@ export default function App() {
         <main className="main">
           {refreshing && <div className="refresh-bar">Syncing…</div>}
 
+          {!isOnline && (
+            <div className="offline-bar">
+              📴 Offline — changes are saved on this device
+              {queue.length > 0 ? ` (${queue.length} pending)` : ""}
+            </div>
+          )}
+          {isOnline && syncing && (
+            <div className="refresh-bar">Syncing {queue.length} change(s)…</div>
+          )}
+          {isOnline && conflicts.length > 0 && (
+            <div className="conflict-bar">
+              ⚠️ {conflicts.length} change
+              {conflicts.length === 1 ? "" : "s"} couldn't sync automatically —
+              resolve below
+            </div>
+          )}
+
           {/* Mobile category bar */}
           <div className="mobile-cats">
             <button
@@ -787,7 +1860,23 @@ export default function App() {
                     ? { borderColor: cat.color, color: cat.color }
                     : {}
                 }
-                onClick={() => changeCategory(cat.id)}
+                onClick={() => {
+                  if (longPressFired.current) {
+                    longPressFired.current = false;
+                    return;
+                  }
+                  changeCategory(cat.id);
+                }}
+                onTouchStart={() => startLongPress(cat)}
+                onTouchEnd={cancelLongPress}
+                onTouchMove={cancelLongPress}
+                onContextMenu={(e) => {
+                  // Long-press on Android WebView also fires contextmenu — suppress it.
+                  if (!cat.locked) e.preventDefault();
+                }}
+                title={
+                  !cat.locked ? "Hold to delete this category" : undefined
+                }
               >
                 {cat.id === FAVOURITE_ID ? (
                   <span>★ {cat.name}</span>
@@ -1158,11 +2247,112 @@ export default function App() {
                           <button
                             className="btn-sub-add"
                             onClick={() => addSubtask(todo.id)}
+                            disabled={!isOnline || todo.id < 0}
+                            title={
+                              !isOnline || todo.id < 0
+                                ? "Connect to the internet to add subtasks"
+                                : "Add subtask"
+                            }
                           >
                             +
                           </button>
                         </div>
                       </div>
+
+                      {todo.dueDate && (
+                        <div className="exp-section">
+                          <span className="exp-label">Reminders</span>
+
+                          <ul className="subtask-list">
+                            {todo.reminders.length === 0 && (
+                              <li className="sub-empty">No reminders</li>
+                            )}
+
+                            {todo.reminders.map((r) => (
+                              <li key={r.id} className="reminder-item">
+                                <button
+                                  className={`check-btn small${r.enabled ? " checked" : ""}`}
+                                  title={r.enabled ? "Enabled" : "Disabled"}
+                                  onClick={() =>
+                                    toggleReminder(todo.id, r.id, r.enabled)
+                                  }
+                                >
+                                  {r.enabled ? "✓" : ""}
+                                </button>
+
+                                <span className="reminder-when">
+                                  {r.daysBefore === 0
+                                    ? "Due today"
+                                    : `${r.daysBefore}d before`}
+                                </span>
+
+                                <input
+                                  className="reminder-msg-input"
+                                  placeholder={settings.defaultReminderMessage}
+                                  defaultValue={r.message ?? ""}
+                                  onBlur={(e) =>
+                                    e.target.value.trim() !== (r.message ?? "") &&
+                                    editReminderMessage(
+                                      todo.id,
+                                      r.id,
+                                      e.target.value,
+                                    )
+                                  }
+                                />
+
+                                <button
+                                  className="icon-btn danger sm"
+                                  onClick={() => deleteReminder(todo.id, r.id)}
+                                >
+                                  ✕
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+
+                          <div className="subtask-add">
+                            <input
+                              type="number"
+                              min={0}
+                              className="form-input reminder-days-input"
+                              placeholder="Days before"
+                              value={reminderDaysInput[todo.id] ?? ""}
+                              onChange={(e) =>
+                                setReminderDaysInput((p) => ({
+                                  ...p,
+                                  [todo.id]: e.target.value,
+                                }))
+                              }
+                            />
+                            <input
+                              className="form-input subtask-input"
+                              placeholder="Message (optional)…"
+                              value={reminderMsgInput[todo.id] ?? ""}
+                              onChange={(e) =>
+                                setReminderMsgInput((p) => ({
+                                  ...p,
+                                  [todo.id]: e.target.value,
+                                }))
+                              }
+                              onKeyDown={(e) =>
+                                e.key === "Enter" && addReminder(todo.id)
+                              }
+                            />
+                            <button
+                              className="btn-sub-add"
+                              onClick={() => addReminder(todo.id)}
+                              disabled={!isOnline || todo.id < 0}
+                              title={
+                                !isOnline || todo.id < 0
+                                  ? "Connect to the internet to add reminders"
+                                  : "Add reminder"
+                              }
+                            >
+                              +
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </li>
@@ -1437,6 +2627,15 @@ const CSS = `
     text-align: center; padding: 8px; background: var(--accent-light);
     color: var(--accent); border-radius: 8px; margin-bottom: 16px; font-size: 13px;
   }
+  .offline-bar {
+    text-align: center; padding: 8px; background: var(--bg);
+    border: 1px dashed var(--border);
+    color: var(--muted); border-radius: 8px; margin-bottom: 16px; font-size: 13px;
+  }
+  .conflict-bar {
+    text-align: center; padding: 8px; background: var(--danger-light);
+    color: var(--danger); border-radius: 8px; margin-bottom: 16px; font-size: 13px;
+  }
 
   .mobile-cats { display: none; gap: 8px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 20px; scrollbar-width: none; }
   .mobile-cats::-webkit-scrollbar { display: none; }
@@ -1577,7 +2776,22 @@ const CSS = `
   .subtask-item { display: flex; align-items: center; gap: 8px; }
   .subtask-text { flex: 1; font-size: 13px; color: var(--muted); }
   .subtask-text.struck { text-decoration: line-through; }
+  .reminder-item { display: flex; align-items: center; gap: 8px; }
+  .reminder-when {
+    font-size: 11.5px; color: var(--muted); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 20px; padding: 2px 8px;
+    flex-shrink: 0; white-space: nowrap;
+  }
+  .reminder-msg-input {
+    flex: 1; min-width: 0; font-size: 12.5px; padding: 6px 9px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+    color: var(--text); font-family: var(--font-body); outline: none;
+  }
+  .reminder-msg-input:focus { border-color: var(--accent); }
+  .reminder-days-input { width: 90px; flex-shrink: 0; }
   .subtask-add { display: flex; gap: 6px; }
+  .btn-sub-add:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-sub-add:disabled:hover { background: none; color: var(--accent); }
   .subtask-input { flex: 1; font-size: 13px; padding: 7px 10px; }
   .btn-sub-add {
     width: 34px; height: 34px; border: 1.5px solid var(--accent); background: none;
@@ -1621,6 +2835,16 @@ const CSS = `
     padding: 28px; width: 340px; max-width: 92vw; box-shadow: 0 20px 60px rgba(0,0,0,0.15);
   }
   .modal-title { font-family: var(--font-head); font-size: 18px; font-weight: 700; margin-bottom: 16px; color: var(--text); }
+  .modal-desc { font-size: 13.5px; color: var(--muted); margin: -8px 0 16px; }
+  .settings-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; font-size: 14px; color: var(--text); margin-bottom: 6px; cursor: pointer;
+  }
+  .conflict-list { display: flex; flex-direction: column; gap: 14px; max-height: 50vh; overflow-y: auto; margin-bottom: 4px; }
+  .conflict-item { border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .conflict-item-title { font-size: 13.5px; font-weight: 600; margin-bottom: 6px; }
+  .conflict-item-versions { display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
+  .conflict-item .modal-actions { justify-content: flex-end; margin: 0; }
   .modal-input {
     width: 100%; padding: 10px 14px; border: 1.5px solid var(--border); border-radius: 10px;
     background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 15px; outline: none; margin-bottom: 14px;
@@ -1633,6 +2857,7 @@ const CSS = `
   }
   .color-swatch.active { border-color: var(--text); transform: scale(1.15); }
   .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .modal-actions-col { flex-direction: column; }
   .btn-ghost {
     padding: 9px 18px; background: none; border: 1px solid var(--border);
     border-radius: 9px; color: var(--muted); font-family: var(--font-body); font-size: 14px; cursor: pointer;
@@ -1641,6 +2866,12 @@ const CSS = `
     padding: 9px 22px; background: var(--accent); color: white; border: none;
     border-radius: 9px; font-family: var(--font-body); font-size: 14px; font-weight: 500; cursor: pointer;
   }
+  .btn-danger {
+    padding: 9px 22px; background: var(--danger); color: white; border: none;
+    border-radius: 9px; font-family: var(--font-body); font-size: 14px; font-weight: 500; cursor: pointer;
+    transition: opacity 0.13s;
+  }
+  .btn-danger:hover { opacity: 0.87; }
     .tabs {
   display: flex;
   gap: 8px;
