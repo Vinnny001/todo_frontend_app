@@ -318,6 +318,11 @@ export default function App({
   const [deleteCatTarget, setDeleteCatTarget] = useState<Category | null>(
     null,
   );
+  // Long-press on a mobile category chip opens this action sheet first
+  // (Add task / Delete) instead of jumping straight to deletion.
+  const [catActionsTarget, setCatActionsTarget] = useState<Category | null>(
+    null,
+  );
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressFired = useRef(false);
 
@@ -1198,7 +1203,7 @@ export default function App({
     longPressTimer.current = setTimeout(() => {
       longPressFired.current = true;
       if (navigator.vibrate) navigator.vibrate(30);
-      setDeleteCatTarget(cat);
+      setCatActionsTarget(cat);
     }, 550);
   };
   const cancelLongPress = () => {
@@ -1298,6 +1303,45 @@ export default function App({
               </button>
               <button className="btn-primary" onClick={saveCat}>
                 Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Category action sheet (long-press on a mobile chip) */}
+      {catActionsTarget && (
+        <div
+          className="modal-overlay"
+          onClick={() => setCatActionsTarget(null)}
+        >
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-title">{catActionsTarget.name}</h3>
+            <div className="modal-actions modal-actions-col">
+              <button
+                className="btn-primary"
+                onClick={() => {
+                  setNewCatId(catActionsTarget.id);
+                  setShowAddModal(true);
+                  setCatActionsTarget(null);
+                }}
+              >
+                + Add task
+              </button>
+              <button
+                className="btn-danger"
+                onClick={() => {
+                  setDeleteCatTarget(catActionsTarget);
+                  setCatActionsTarget(null);
+                }}
+              >
+                Delete category
+              </button>
+              <button
+                className="btn-ghost"
+                onClick={() => setCatActionsTarget(null)}
+              >
+                Cancel
               </button>
             </div>
           </div>
@@ -1639,7 +1683,7 @@ export default function App({
                   if (!cat.locked) e.preventDefault();
                 }}
                 title={
-                  !cat.locked ? "Hold to delete this category" : undefined
+                  !cat.locked ? "Hold for options" : undefined
                 }
               >
                 {cat.id === favouriteCatId ? (
