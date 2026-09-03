@@ -5,6 +5,8 @@ import {
   LocalNotifications,
   type PermissionStatus,
 } from "@capacitor/local-notifications";
+import { API } from "./config";
+import { ContextMenu } from "./components/ContextMenu";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -32,18 +34,12 @@ type Category = {
   color: string;
   locked?: boolean;
   updatedAt?: string;
+  kind?: "default" | "favourite" | null;
 };
 type AppSettings = {
   notifyDueTodayEnabled: boolean;
   defaultReminderMessage: string;
 };
-type MenuItem = {
-  label: string;
-  icon: string;
-  danger?: boolean;
-  onClick: () => void;
-};
-
 // ─── Offline queue types ───────────────────────────────────────────────────────
 
 type TodoChanges = Partial<{
@@ -69,7 +65,10 @@ type QueueAction =
       kind: "updateTodo";
       todoId: number;
       changes: TodoChanges;
-      expectedUpdatedAt: string | null;
+      // Real-world moment the user made this edit, captured client-side —
+      // lets the server auto-resolve conflicts by last-write-wins instead
+      // of asking anyone to pick a version. See PATCH /todos/:id.
+      clientEditedAt: string;
     }
   | { id: string; kind: "deleteTodo"; todoId: number }
   | {
@@ -84,26 +83,16 @@ type QueueAction =
       kind: "updateCategory";
       catId: number;
       changes: CatChanges;
-      expectedUpdatedAt: string | null;
+      clientEditedAt: string;
     }
   | { id: string; kind: "deleteCategoryMove"; catId: number }
   | { id: string; kind: "deleteCategoryWithTasks"; catId: number };
-
-type Conflict = {
-  id: string;
-  type: "todo" | "category";
-  entityId: number;
-  local: Todo | Category;
-  server: Todo | Category;
-  changes: TodoChanges | CatChanges;
-};
 
 // ─── Offline storage helpers ───────────────────────────────────────────────────
 
 const LS_TODOS = "todo_cache_todos";
 const LS_CATS = "todo_cache_categories";
 const LS_QUEUE = "todo_mutation_queue";
-const LS_CONFLICTS = "todo_conflicts";
 
 function loadLS<T>(key: string, fallback: T): T {
   try {
@@ -184,8 +173,6 @@ async function scheduleAllReminders(todos: Todo[], settings: AppSettings) {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const API = "https://crud-todo-api-776p.onrender.com";
-const FAVOURITE_ID = 2;
 const PRESET_COLORS = [
   "#6366f1",
   "#f59e0b",
@@ -227,51 +214,6 @@ function ColorDot({ color, size = 9 }: { color: string; size?: number }) {
   );
 }
 
-// ─── ContextMenu ──────────────────────────────────────────────────────────────
-
-function ContextMenu({
-  items,
-  onClose,
-  anchorRef,
-}: {
-  items: MenuItem[];
-  onClose: () => void;
-  anchorRef: React.RefObject<HTMLButtonElement | null>;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const h = (e: MouseEvent) => {
-      if (
-        ref.current &&
-        !ref.current.contains(e.target as Node) &&
-        anchorRef.current &&
-        !anchorRef.current.contains(e.target as Node)
-      )
-        onClose();
-    };
-    document.addEventListener("mousedown", h);
-    return () => document.removeEventListener("mousedown", h);
-  }, [onClose, anchorRef]);
-
-  return (
-    <div className="ctx-menu" ref={ref}>
-      {items.map((item) => (
-        <button
-          key={item.label}
-          className={`ctx-item${item.danger ? " danger" : ""}`}
-          onClick={() => {
-            item.onClick();
-            onClose();
-          }}
-        >
-          <span className="ctx-icon">{item.icon}</span>
-          {item.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 // ─── StarButton ───────────────────────────────────────────────────────────────
 
 function StarButton({
@@ -294,13 +236,23 @@ function StarButton({
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
-export default function App() {
+export default function App({
+  accountSlot,
+}: {
+  accountSlot?: React.ReactNode;
+}) {
   const [todos, setTodos] = useState<Todo[]>(() =>
     loadLS<Todo[]>(LS_TODOS, []),
   );
   const [categories, setCategories] = useState<Category[]>(() =>
     loadLS<Category[]>(LS_CATS, []),
   );
+  // Categories are per-user — ids are no longer stable across accounts, so
+  // the "My Tasks" / "Favourite" categories are identified by their `kind`
+  // field rather than a hardcoded id.
+  const favouriteCatId =
+    categories.find((c) => c.kind === "favourite")?.id ?? null;
+  const defaultCatId = categories.find((c) => c.kind === "default")?.id ?? null;
   const [activeCatId, setActiveCatId] = useState<number | null>(null);
   const [statusFilter, setStatusFilter] = useState<
     "all" | "pending" | "completed"
@@ -340,7 +292,13 @@ export default function App() {
   // New todo form
   const [task, setTask] = useState("");
   const [dueDate, setDueDate] = useState("");
-  const [newCatId, setNewCatId] = useState<number>(1);
+  // 0 is a sentinel for "not yet initialized" — never a real (>=1) or
+  // temp-offline (negative) category id, so it can't collide with a real
+  // category (unlike the old hardcoded `1`, which broke for any user whose
+  // "My Tasks" category wasn't literally id 1).
+  const [newCatId, setNewCatId] = useState<number>(0);
+  const [newReminderDays, setNewReminderDays] = useState("");
+  const [newReminderMsg, setNewReminderMsg] = useState("");
 
   // Sidebar
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -385,13 +343,9 @@ export default function App() {
   const [queue, setQueue] = useState<QueueAction[]>(() =>
     loadLS<QueueAction[]>(LS_QUEUE, []),
   );
-  const [conflicts, setConflicts] = useState<Conflict[]>(() =>
-    loadLS<Conflict[]>(LS_CONFLICTS, []),
-  );
   const [syncing, setSyncing] = useState(false);
 
   const todosRef = useRef<Todo[]>([]);
-  const categoriesRef = useRef<Category[]>([]);
   const queueRef = useRef<QueueAction[]>([]);
   const syncingRef = useRef(false);
   const nextTempIdRef = useRef(-1);
@@ -401,16 +355,12 @@ export default function App() {
     saveLS(LS_TODOS, todos);
   }, [todos]);
   useEffect(() => {
-    categoriesRef.current = categories;
     saveLS(LS_CATS, categories);
   }, [categories]);
   useEffect(() => {
     queueRef.current = queue;
     saveLS(LS_QUEUE, queue);
   }, [queue]);
-  useEffect(() => {
-    saveLS(LS_CONFLICTS, conflicts);
-  }, [conflicts]);
 
   const nextTempId = () => nextTempIdRef.current--;
 
@@ -420,7 +370,6 @@ export default function App() {
     notifyDueTodayEnabled: true,
     defaultReminderMessage: 'Task "{task}" is due today!',
   });
-  const [settingsModal, setSettingsModal] = useState(false);
   const [notifPermission, setNotifPermission] =
     useState<PermissionStatus["display"]>("prompt");
 
@@ -434,9 +383,9 @@ export default function App() {
     setTodos(tr.data);
     setCategories(cr.data);
     setNewCatId((p) => {
-      // default to first non-favourite category
-      if (p === 1 && cr.data.length) {
-        const nonFav = cr.data.find((c) => c.id !== FAVOURITE_ID);
+      // default to first non-favourite category (still uninitialized)
+      if (p === 0 && cr.data.length) {
+        const nonFav = cr.data.find((c) => c.kind !== "favourite");
         return nonFav ? nonFav.id : cr.data[0].id;
       }
       return p;
@@ -520,44 +469,6 @@ export default function App() {
     }
   }
 
-  const addConflict = (c: Omit<Conflict, "id">) =>
-    setConflicts((p) => [...p, { ...c, id: uid() }]);
-
-  const resolveConflictKeepMine = async (c: Conflict) => {
-    try {
-      if (c.type === "todo") {
-        const res = await axios.patch<Todo>(
-          `${API}/todos/${c.entityId}`,
-          c.changes,
-        );
-        setTodos((p) => p.map((t) => (t.id === c.entityId ? res.data : t)));
-      } else {
-        const res = await axios.patch<Category>(
-          `${API}/categories/${c.entityId}`,
-          c.changes,
-        );
-        setCategories((p) =>
-          p.map((cat) => (cat.id === c.entityId ? res.data : cat)),
-        );
-      }
-    } finally {
-      setConflicts((p) => p.filter((x) => x.id !== c.id));
-    }
-  };
-
-  const resolveConflictKeepServer = (c: Conflict) => {
-    if (c.type === "todo") {
-      setTodos((p) =>
-        p.map((t) => (t.id === c.entityId ? (c.server as Todo) : t)),
-      );
-    } else {
-      setCategories((p) =>
-        p.map((cat) => (cat.id === c.entityId ? (c.server as Category) : cat)),
-      );
-    }
-    setConflicts((p) => p.filter((x) => x.id !== c.id));
-  };
-
   // ── Local notifications ──────────────────────────────────────────────────
 
   useEffect(() => {
@@ -580,19 +491,6 @@ export default function App() {
     if (notifPermission !== "granted") return;
     scheduleAllReminders(todos, settings).catch(() => {});
   }, [todos, settings, notifPermission]);
-
-  // ── Notification settings ────────────────────────────────────────────────
-
-  const updateSettings = async (changes: Partial<AppSettings>) => {
-    setSettings((p) => ({ ...p, ...changes }));
-    if (!isOnline) return;
-    try {
-      const res = await axios.patch<AppSettings>(`${API}/settings`, changes);
-      setSettings(res.data);
-    } catch {
-      // will simply retry from server state on next successful fetch
-    }
-  };
 
   // ── Per-task reminders (online-only) ─────────────────────────────────────
 
@@ -685,29 +583,15 @@ export default function App() {
           try {
             const res = await axios.patch<Todo>(
               `${API}/todos/${action.todoId}`,
-              { ...action.changes, expectedUpdatedAt: action.expectedUpdatedAt },
+              { ...action.changes, clientEditedAt: action.clientEditedAt },
             );
+            // The server silently resolves stale writes itself (see
+            // PATCH /todos/:id) — whatever comes back is simply adopted.
             setTodos((p) =>
               p.map((t) => (t.id === action.todoId ? res.data : t)),
             );
           } catch (err) {
-            const status = axios.isAxiosError(err)
-              ? err.response?.status
-              : undefined;
-            if (status === 409 && axios.isAxiosError(err)) {
-              const local = todosRef.current.find(
-                (t) => t.id === action.todoId,
-              );
-              if (local) {
-                addConflict({
-                  type: "todo",
-                  entityId: action.todoId,
-                  local,
-                  server: err.response!.data.server,
-                  changes: action.changes,
-                });
-              }
-            } else if (status === 404) {
+            if (axios.isAxiosError(err) && err.response?.status === 404) {
               setTodos((p) => p.filter((t) => t.id !== action.todoId));
             } else {
               throw err;
@@ -734,29 +618,13 @@ export default function App() {
           try {
             const res = await axios.patch<Category>(
               `${API}/categories/${action.catId}`,
-              { ...action.changes, expectedUpdatedAt: action.expectedUpdatedAt },
+              { ...action.changes, clientEditedAt: action.clientEditedAt },
             );
             setCategories((p) =>
               p.map((c) => (c.id === action.catId ? res.data : c)),
             );
           } catch (err) {
-            const status = axios.isAxiosError(err)
-              ? err.response?.status
-              : undefined;
-            if (status === 409 && axios.isAxiosError(err)) {
-              const local = categoriesRef.current.find(
-                (c) => c.id === action.catId,
-              );
-              if (local) {
-                addConflict({
-                  type: "category",
-                  entityId: action.catId,
-                  local,
-                  server: err.response!.data.server,
-                  changes: action.changes,
-                });
-              }
-            } else if (status === 404) {
+            if (axios.isAxiosError(err) && err.response?.status === 404) {
               setCategories((p) => p.filter((c) => c.id !== action.catId));
             } else {
               throw err;
@@ -827,7 +695,7 @@ export default function App() {
     // 1. Category filter
     if (activeCatId === null) {
       filtered = todos;
-    } else if (activeCatId === FAVOURITE_ID) {
+    } else if (activeCatId === favouriteCatId) {
       filtered = todos.filter((t) => t.favourited);
     } else {
       filtered = todos.filter((t) => t.categoryId === activeCatId);
@@ -880,11 +748,24 @@ export default function App() {
   const addTodo = async (catOverride?: number) => {
     if (!task.trim()) return;
     const targetCat = catOverride ?? newCatId;
-    if (targetCat === FAVOURITE_ID) return; // guard
+    if (targetCat === favouriteCatId) return; // guard
     const payload = {
       task: task.trim(),
       dueDate: dueDate || null,
       categoryId: targetCat,
+    };
+    // Reminders are online-only (see the offline banner) — a queued offline
+    // create still gets the default "due today" reminder once it syncs.
+    const days = parseInt(newReminderDays, 10);
+    const reminderPayload =
+      payload.dueDate && !Number.isNaN(days) && days >= 0
+        ? { reminderDaysBefore: days, reminderMessage: newReminderMsg.trim() || undefined }
+        : {};
+    const resetForm = () => {
+      setTask("");
+      setDueDate("");
+      setNewReminderDays("");
+      setNewReminderMsg("");
     };
 
     if (!isOnline) {
@@ -897,13 +778,15 @@ export default function App() {
         ...p,
         { id: uid(), kind: "createTodo", tempId, ...payload },
       ]);
-      setTask("");
-      setDueDate("");
+      resetForm();
       return;
     }
 
     try {
-      const res = await axios.post<Todo>(`${API}/todos`, payload);
+      const res = await axios.post<Todo>(`${API}/todos`, {
+        ...payload,
+        ...reminderPayload,
+      });
       setTodos((p) => [...p, res.data]);
     } catch (err) {
       if (!axios.isAxiosError(err) || !err.response) {
@@ -920,12 +803,11 @@ export default function App() {
         throw err;
       }
     }
-    setTask("");
-    setDueDate("");
+    resetForm();
   };
 
   const addTodoInCat = async (t: string, catId: number) => {
-    if (!t.trim() || catId === FAVOURITE_ID) return;
+    if (!t.trim() || catId === favouriteCatId) return;
     const payload = { task: t.trim(), dueDate: null, categoryId: catId };
 
     if (!isOnline) {
@@ -961,11 +843,13 @@ export default function App() {
     }
   };
 
-  // Routes every todo field edit through the offline queue + conflict check
+  // Routes every todo field edit through the offline queue. Conflicts are
+  // resolved automatically and silently by the server via clientEditedAt
+  // (last-write-wins on real event time) — nothing here ever prompts the user.
   const updateTodoFields = async (id: number, changes: TodoChanges) => {
     const current = todosRef.current.find((t) => t.id === id);
     if (!current) return;
-    const expectedUpdatedAt = current.updatedAt ?? null;
+    const clientEditedAt = new Date().toISOString();
 
     setTodos((p) => p.map((t) => (t.id === id ? { ...t, ...changes } : t)));
 
@@ -990,7 +874,7 @@ export default function App() {
     if (!isOnline) {
       setQueue((p) => [
         ...p,
-        { id: uid(), kind: "updateTodo", todoId: id, changes, expectedUpdatedAt },
+        { id: uid(), kind: "updateTodo", todoId: id, changes, clientEditedAt },
       ]);
       return;
     }
@@ -998,22 +882,14 @@ export default function App() {
     try {
       const res = await axios.patch<Todo>(`${API}/todos/${id}`, {
         ...changes,
-        expectedUpdatedAt,
+        clientEditedAt,
       });
       setTodos((p) => p.map((t) => (t.id === id ? res.data : t)));
     } catch (err) {
-      if (axios.isAxiosError(err) && err.response?.status === 409) {
-        addConflict({
-          type: "todo",
-          entityId: id,
-          local: { ...current, ...changes },
-          server: err.response.data.server,
-          changes,
-        });
-      } else if (!axios.isAxiosError(err) || !err.response) {
+      if (!axios.isAxiosError(err) || !err.response) {
         setQueue((p) => [
           ...p,
-          { id: uid(), kind: "updateTodo", todoId: id, changes, expectedUpdatedAt },
+          { id: uid(), kind: "updateTodo", todoId: id, changes, clientEditedAt },
         ]);
       } else {
         throw err;
@@ -1068,7 +944,10 @@ export default function App() {
 
   const saveEditTodo = async (id: number) => {
     if (!editTask.trim()) return;
-    const catId = editCatIdState === FAVOURITE_ID ? 1 : editCatIdState;
+    const catId =
+      editCatIdState === favouriteCatId
+        ? (defaultCatId ?? editCatIdState)
+        : editCatIdState;
     await updateTodoFields(id, {
       task: editTask.trim(),
       dueDate: editDue || null,
@@ -1081,11 +960,17 @@ export default function App() {
     setEditingTodo(todo.id);
     setEditTask(todo.task);
     setEditDue(todo.dueDate || "");
-    setEditCatIdState(todo.categoryId === FAVOURITE_ID ? 1 : todo.categoryId);
+    setEditCatIdState(
+      todo.categoryId === favouriteCatId
+        ? (defaultCatId ?? todo.categoryId)
+        : todo.categoryId,
+    );
+    // expand so the reminders/subtasks panel is visible right away
+    setExpandedTodos((s) => new Set(s).add(todo.id));
   };
 
   const moveTodoCat = (id: number, categoryId: number) => {
-    if (categoryId === FAVOURITE_ID) return; // star logic only
+    if (categoryId === favouriteCatId) return; // star logic only
     return updateTodoFields(id, { categoryId });
   };
 
@@ -1142,8 +1027,7 @@ export default function App() {
     if (editCat) {
       const catId = editCat.id;
       const changes: CatChanges = { name, color };
-      const current = categoriesRef.current.find((c) => c.id === catId);
-      const expectedUpdatedAt = current?.updatedAt ?? null;
+      const clientEditedAt = new Date().toISOString();
 
       setCategories((p) =>
         p.map((c) => (c.id === catId ? { ...c, ...changes } : c)),
@@ -1164,7 +1048,7 @@ export default function App() {
       if (!isOnline) {
         setQueue((p) => [
           ...p,
-          { id: uid(), kind: "updateCategory", catId, changes, expectedUpdatedAt },
+          { id: uid(), kind: "updateCategory", catId, changes, clientEditedAt },
         ]);
         return;
       }
@@ -1172,22 +1056,14 @@ export default function App() {
       try {
         const res = await axios.patch<Category>(`${API}/categories/${catId}`, {
           ...changes,
-          expectedUpdatedAt,
+          clientEditedAt,
         });
         setCategories((p) => p.map((c) => (c.id === catId ? res.data : c)));
       } catch (err) {
-        if (axios.isAxiosError(err) && err.response?.status === 409 && current) {
-          addConflict({
-            type: "category",
-            entityId: catId,
-            local: { ...current, ...changes },
-            server: err.response.data.server,
-            changes,
-          });
-        } else if (!axios.isAxiosError(err) || !err.response) {
+        if (!axios.isAxiosError(err) || !err.response) {
           setQueue((p) => [
             ...p,
-            { id: uid(), kind: "updateCategory", catId, changes, expectedUpdatedAt },
+            { id: uid(), kind: "updateCategory", catId, changes, clientEditedAt },
           ]);
         }
       }
@@ -1235,7 +1111,11 @@ export default function App() {
   const deleteCatMoveTasks = async (id: number) => {
     setCategories((p) => p.filter((c) => c.id !== id));
     setTodos((p) =>
-      p.map((t) => (t.categoryId === id ? { ...t, categoryId: 1 } : t)),
+      p.map((t) =>
+        t.categoryId === id
+          ? { ...t, categoryId: defaultCatId ?? t.categoryId }
+          : t,
+      ),
     );
     if (activeCatId === id) setActiveCatId(null);
     setDeleteCatTarget(null);
@@ -1331,7 +1211,10 @@ export default function App() {
   // ── UI helpers ────────────────────────────────────────────────────────────
 
   const getCat = (id: number) => categories.find((c) => c.id === id);
-  const isFavouriteView = activeCatId === FAVOURITE_ID;
+  // Guard against activeCatId (All Tasks == null) spuriously matching
+  // favouriteCatId before categories have loaded (also null).
+  const isFavouriteView =
+    favouriteCatId !== null && activeCatId === favouriteCatId;
 
   const toggleCatExpand = (id: number) =>
     setExpandedCats((s) => {
@@ -1355,13 +1238,13 @@ export default function App() {
   const selectedCategory = getCat(newCatId);
 
   // Non-favourite categories for selects/chips
-  const nonFavCats = categories.filter((c) => c.id !== FAVOURITE_ID);
+  const nonFavCats = categories.filter((c) => c.id !== favouriteCatId);
 
   // ── Counts ─────────────────────────────────────────────
 
   const baseFiltered = (() => {
     if (activeCatId === null) return todos;
-    if (activeCatId === FAVOURITE_ID) return todos.filter((t) => t.favourited);
+    if (activeCatId === favouriteCatId) return todos.filter((t) => t.favourited);
     return todos.filter((t) => t.categoryId === activeCatId);
   })();
 
@@ -1458,113 +1341,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Notification settings modal */}
-      {settingsModal && (
-        <div
-          className="modal-overlay"
-          onClick={() => setSettingsModal(false)}
-        >
-          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
-            <h3 className="modal-title">Notification Settings</h3>
-
-            <label className="settings-row">
-              <span>Notify me when a task is due today</span>
-              <input
-                type="checkbox"
-                checked={settings.notifyDueTodayEnabled}
-                onChange={(e) =>
-                  updateSettings({ notifyDueTodayEnabled: e.target.checked })
-                }
-              />
-            </label>
-
-            <p className="modal-desc" style={{ marginTop: 12 }}>
-              Default reminder message (use {"{task}"} for the task name)
-            </p>
-            <input
-              className="modal-input"
-              value={settings.defaultReminderMessage}
-              onChange={(e) =>
-                setSettings((p) => ({
-                  ...p,
-                  defaultReminderMessage: e.target.value,
-                }))
-              }
-              onBlur={(e) =>
-                updateSettings({ defaultReminderMessage: e.target.value })
-              }
-            />
-
-            {notifPermission !== "granted" && (
-              <p className="modal-desc" style={{ color: "var(--danger)" }}>
-                Notifications are {notifPermission} on this device — enable
-                them in system settings to receive reminders.
-              </p>
-            )}
-
-            <div className="modal-actions">
-              <button
-                className="btn-primary"
-                onClick={() => setSettingsModal(false)}
-              >
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Conflict resolution modal */}
-      {conflicts.length > 0 && (
-        <div className="modal-overlay">
-          <div className="modal-box">
-            <h3 className="modal-title">Resolve sync conflicts</h3>
-            <p className="modal-desc">
-              These changed both on this device (while offline) and elsewhere
-              since you were last online. Choose which version to keep.
-            </p>
-            <div className="conflict-list">
-              {conflicts.map((c) => {
-                const localLabel =
-                  c.type === "todo"
-                    ? (c.local as Todo).task
-                    : (c.local as Category).name;
-                const serverLabel =
-                  c.type === "todo"
-                    ? (c.server as Todo).task
-                    : (c.server as Category).name;
-                return (
-                  <div key={c.id} className="conflict-item">
-                    <div className="conflict-item-title">
-                      {c.type === "todo" ? "Task" : "Category"}: "
-                      {serverLabel}"
-                    </div>
-                    <div className="conflict-item-versions">
-                      <span>Yours: "{localLabel}"</span>
-                      <span>Server: "{serverLabel}"</span>
-                    </div>
-                    <div className="modal-actions">
-                      <button
-                        className="btn-ghost"
-                        onClick={() => resolveConflictKeepServer(c)}
-                      >
-                        Keep server's
-                      </button>
-                      <button
-                        className="btn-primary"
-                        onClick={() => resolveConflictKeepMine(c)}
-                      >
-                        Keep mine
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      )}
-
       <div
         className="layout"
         onTouchStart={handleTouchStart}
@@ -1583,14 +1359,7 @@ export default function App() {
             <>
               <div className="sidebar-header">
                 <span className="sidebar-logo">✦ Lists</span>
-                <div style={{ display: "flex", gap: 6 }}>
-                  <button
-                    className="add-cat-icon"
-                    onClick={() => setSettingsModal(true)}
-                    title="Notification settings"
-                  >
-                    🔔
-                  </button>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
                   <button
                     className="add-cat-icon"
                     onClick={openNewCat}
@@ -1598,6 +1367,7 @@ export default function App() {
                   >
                     +
                   </button>
+                  {accountSlot}
                 </div>
               </div>
 
@@ -1614,7 +1384,7 @@ export default function App() {
 
                 {/* Per-category */}
                 {categories.map((cat) => {
-                  const isFav = cat.id === FAVOURITE_ID;
+                  const isFav = cat.id === favouriteCatId;
                   const catTodos = isFav
                     ? todos.filter((t) => t.favourited)
                     : todos.filter((t) => t.categoryId === cat.id);
@@ -1835,15 +1605,9 @@ export default function App() {
           {isOnline && syncing && (
             <div className="refresh-bar">Syncing {queue.length} change(s)…</div>
           )}
-          {isOnline && conflicts.length > 0 && (
-            <div className="conflict-bar">
-              ⚠️ {conflicts.length} change
-              {conflicts.length === 1 ? "" : "s"} couldn't sync automatically —
-              resolve below
-            </div>
-          )}
 
           {/* Mobile category bar */}
+          <div className="mobile-topbar">
           <div className="mobile-cats">
             <button
               className={`mobile-cat${activeCatId === null ? " active" : ""}`}
@@ -1854,9 +1618,9 @@ export default function App() {
             {categories.map((cat) => (
               <button
                 key={cat.id}
-                className={`mobile-cat${activeCatId === cat.id ? " active" : ""}${cat.id === FAVOURITE_ID ? " fav-tab" : ""}`}
+                className={`mobile-cat${activeCatId === cat.id ? " active" : ""}${cat.id === favouriteCatId ? " fav-tab" : ""}`}
                 style={
-                  activeCatId === cat.id && cat.id !== FAVOURITE_ID
+                  activeCatId === cat.id && cat.id !== favouriteCatId
                     ? { borderColor: cat.color, color: cat.color }
                     : {}
                 }
@@ -1878,7 +1642,7 @@ export default function App() {
                   !cat.locked ? "Hold to delete this category" : undefined
                 }
               >
-                {cat.id === FAVOURITE_ID ? (
+                {cat.id === favouriteCatId ? (
                   <span>★ {cat.name}</span>
                 ) : (
                   <>
@@ -1891,11 +1655,13 @@ export default function App() {
               +
             </button>
           </div>
+          <div className="mobile-account-slot">{accountSlot}</div>
+          </div>
 
           {/* Page header */}
           <header className="page-header">
             <div className="page-title-row">
-              {activeCatId === FAVOURITE_ID && (
+              {isFavouriteView && (
                 <span className="fav-icon-big">★</span>
               )}
               <h1 className="page-title">
@@ -2080,7 +1846,7 @@ export default function App() {
                             </span>
                           </div>
                           <div className="todo-meta">
-                            {cat && cat.id !== FAVOURITE_ID && (
+                            {cat && cat.id !== favouriteCatId && (
                               <span
                                 className="meta-tag"
                                 style={{
@@ -2191,7 +1957,7 @@ export default function App() {
                   </div>
 
                   {/* Expanded panel */}
-                  {isExp && !isEdit && (
+                  {isExp && (
                     <div className="exp-panel">
                       <div className="exp-section">
                         <span className="exp-label">Subtasks</span>
@@ -2410,6 +2176,31 @@ export default function App() {
         ))}
       </select>
 
+      {dueDate && isOnline && (
+        <div className="new-reminder-row">
+          <input
+            type="number"
+            min={0}
+            className="form-input reminder-days-input"
+            placeholder="Remind me: days before"
+            value={newReminderDays}
+            onChange={(e) => setNewReminderDays(e.target.value)}
+          />
+          <input
+            className="modal-input"
+            placeholder="Reminder message (optional)"
+            value={newReminderMsg}
+            onChange={(e) => setNewReminderMsg(e.target.value)}
+          />
+        </div>
+      )}
+      {dueDate && !isOnline && (
+        <p className="modal-desc">
+          You'll get the default "due today" reminder once this task syncs —
+          connect to add a custom one.
+        </p>
+      )}
+
       <div className="modal-actions">
         <button
           className="btn-ghost"
@@ -2442,27 +2233,7 @@ export default function App() {
 // ─── CSS ──────────────────────────────────────────────────────────────────────
 
 const CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@500;700&display=swap');
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  :root {
-    --bg: #f8f7f4; --surface: #ffffff; --border: #e8e5e0;
-    --text: #1a1814; --muted: #8a8580;
-    --accent: #2d6a4f; --accent-light: #d8f3dc;
-    --danger: #c9363e; --danger-light: #fde8e9;
-    --fav: #f59e0b; --fav-light: #fef3c7;
-    --radius: 14px; --shadow: 0 2px 12px rgba(0,0,0,0.06); --shadow-md: 0 8px 32px rgba(0,0,0,0.13);
-    --font-body: 'DM Sans', sans-serif; --font-head: 'Syne', sans-serif;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #141412; --surface: #1f1e1b; --border: #2e2c28;
-      --text: #f0ede8; --muted: #6b6860;
-      --accent: #52b788; --accent-light: #1b3a2a;
-      --danger: #e05c63; --danger-light: #3a1a1c;
-      --fav: #fbbf24; --fav-light: #2d2007;
-    }
-  }
 
   body { font-family: var(--font-body); background: var(--bg); color: var(--text); min-height: 100svh; }
   .layout { display: flex; min-height: 100svh; }
@@ -2632,13 +2403,10 @@ const CSS = `
     border: 1px dashed var(--border);
     color: var(--muted); border-radius: 8px; margin-bottom: 16px; font-size: 13px;
   }
-  .conflict-bar {
-    text-align: center; padding: 8px; background: var(--danger-light);
-    color: var(--danger); border-radius: 8px; margin-bottom: 16px; font-size: 13px;
-  }
-
-  .mobile-cats { display: none; gap: 8px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 20px; scrollbar-width: none; }
+  .mobile-topbar { display: none; align-items: center; gap: 8px; margin-bottom: 20px; }
+  .mobile-cats { display: none; gap: 8px; overflow-x: auto; padding-bottom: 4px; scrollbar-width: none; flex: 1; min-width: 0; }
   .mobile-cats::-webkit-scrollbar { display: none; }
+  .mobile-account-slot { flex-shrink: 0; }
   .mobile-cat {
     display: inline-flex; align-items: center; gap: 5px; padding: 6px 14px;
     border: 1.5px solid var(--border); border-radius: 20px; background: var(--surface);
@@ -2836,15 +2604,13 @@ const CSS = `
   }
   .modal-title { font-family: var(--font-head); font-size: 18px; font-weight: 700; margin-bottom: 16px; color: var(--text); }
   .modal-desc { font-size: 13.5px; color: var(--muted); margin: -8px 0 16px; }
+  .new-reminder-row { display: flex; gap: 8px; margin-bottom: 14px; }
+  .new-reminder-row .reminder-days-input { flex-shrink: 0; width: 130px; margin-bottom: 0; }
+  .new-reminder-row .modal-input { margin-bottom: 0; }
   .settings-row {
     display: flex; align-items: center; justify-content: space-between;
     gap: 12px; font-size: 14px; color: var(--text); margin-bottom: 6px; cursor: pointer;
   }
-  .conflict-list { display: flex; flex-direction: column; gap: 14px; max-height: 50vh; overflow-y: auto; margin-bottom: 4px; }
-  .conflict-item { border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
-  .conflict-item-title { font-size: 13.5px; font-weight: 600; margin-bottom: 6px; }
-  .conflict-item-versions { display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
-  .conflict-item .modal-actions { justify-content: flex-end; margin: 0; }
   .modal-input {
     width: 100%; padding: 10px 14px; border: 1.5px solid var(--border); border-radius: 10px;
     background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 15px; outline: none; margin-bottom: 14px;
@@ -2930,6 +2696,7 @@ const CSS = `
   /* Mobile */
   @media (max-width: 768px) {
     .sidebar { display: none; }
+    .mobile-topbar { display: flex; }
     .mobile-cats { display: flex; }
     .main { padding: 18px 16px 80px; }
     .add-form { flex-direction: column; }

@@ -1,0 +1,219 @@
+/* ── Auth pages (login/signup/verify/forgot/reset) + Profile/Settings pages ── */
+/* Reuses the theme variables defined in src/index.css and mirrors the
+   modal-box / modal-input / btn-primary / btn-ghost look from App.tsx. */
+
+.auth-screen {
+  min-height: 100svh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  padding: 24px;
+  font-family: var(--font-body);
+  color: var(--text);
+}
+
+.auth-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  padding: 32px;
+  width: 380px;
+  max-width: 100%;
+}
+
+.auth-title {
+  font-family: var(--font-head);
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+
+.auth-subtitle {
+  font-size: 13.5px;
+  color: var(--muted);
+  margin-bottom: 20px;
+}
+
+.auth-input {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 15px;
+  outline: none;
+  margin-bottom: 12px;
+}
+.auth-input:focus {
+  border-color: var(--accent);
+}
+
+.auth-label {
+  display: block;
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.auth-error {
+  background: var(--danger-light);
+  color: var(--danger);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.auth-success {
+  background: var(--accent-light);
+  color: var(--accent);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+/* Note: deliberately namespaced as .auth-btn-* rather than reusing App.tsx's
+   .btn-primary/.btn-ghost class names verbatim — this stylesheet is loaded
+   globally (alongside App.tsx's own embedded <style>) once logged in, so
+   identical class names would fight over which stylesheet wins the cascade.
+   The look/values below are copied from App.tsx's .btn-primary/.btn-ghost. */
+.auth-btn-primary,
+.auth-btn-ghost {
+  font-family: var(--font-body);
+  font-size: 14px;
+  cursor: pointer;
+  border-radius: 9px;
+}
+.auth-btn-primary {
+  width: 100%;
+  padding: 10px 22px;
+  background: var(--accent);
+  color: white;
+  border: none;
+  font-weight: 500;
+  margin-top: 4px;
+}
+.auth-btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.auth-btn-ghost {
+  padding: 9px 18px;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.auth-footer {
+  margin-top: 16px;
+  font-size: 13.5px;
+  color: var(--muted);
+  text-align: center;
+}
+.auth-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 13.5px;
+  padding: 0;
+  text-decoration: underline;
+}
+.auth-link:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  text-decoration: none;
+}
+
+/* ── Full-screen pages (Profile / Account Settings) ── */
+.page-screen {
+  min-height: 100svh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+}
+.page-screen-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.page-screen-title {
+  font-family: var(--font-head);
+  font-size: 19px;
+  font-weight: 700;
+}
+.page-screen-body {
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 28px 24px 60px;
+}
+.page-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 22px;
+  margin-bottom: 20px;
+}
+.page-section-title {
+  font-family: var(--font-head);
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 14px;
+}
+
+/* Avatar */
+.avatar {
+  border-radius: 50%;
+  object-fit: cover;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: white;
+  font-family: var(--font-head);
+  font-weight: 700;
+  flex-shrink: 0;
+  user-select: none;
+}
+.avatar-lg {
+  width: 84px;
+  height: 84px;
+  font-size: 34px;
+  margin: 0 auto 18px;
+}
+.avatar-sm {
+  width: 30px;
+  height: 30px;
+  font-size: 13px;
+}
+
+.avatar-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  border-radius: 50%;
+  line-height: 0;
+}
+
+.auth-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 14px;
+  color: var(--text);
+  margin-bottom: 6px;
+  cursor: pointer;
+}

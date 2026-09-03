@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@500;700&display=swap');
+
 :root {
   --text: #6b6375;
   --text-h: #08060d;
@@ -48,6 +50,39 @@
   #social .button-icon {
     filter: invert(1) brightness(2);
   }
+}
+
+/* ── App theme variables (relocated from App.tsx so auth pages that render
+   before App mounts still have them available) ── */
+:root {
+  --bg: #f8f7f4; --surface: #ffffff; --border: #e8e5e0;
+  --text: #1a1814; --muted: #8a8580;
+  --accent: #2d6a4f; --accent-light: #d8f3dc;
+  --danger: #c9363e; --danger-light: #fde8e9;
+  --fav: #f59e0b; --fav-light: #fef3c7;
+  --radius: 14px; --shadow: 0 2px 12px rgba(0,0,0,0.06); --shadow-md: 0 8px 32px rgba(0,0,0,0.13);
+  --font-body: 'DM Sans', sans-serif; --font-head: 'Syne', sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141412; --surface: #1f1e1b; --border: #2e2c28;
+    --text: #f0ede8; --muted: #6b6860;
+    --accent: #52b788; --accent-light: #1b3a2a;
+    --danger: #e05c63; --danger-light: #3a1a1c;
+    --fav: #fbbf24; --fav-light: #2d2007;
+  }
+}
+
+/* ── Global text-selection / copy lock (product decision, web layer only) ── */
+html, body, #root {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+input, textarea {
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-touch-callout: default;
 }
 
 #root {
