@@ -8,6 +8,13 @@ import {
 } from "@capacitor/local-notifications";
 import { API } from "./config";
 import { ContextMenu } from "./components/ContextMenu";
+import {
+  type Routine,
+  nextOccurrence,
+  occurrenceDateKey,
+  isOccurrenceDone,
+  describeRecurrence,
+} from "./routines";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -97,6 +104,7 @@ type QueueAction =
 
 const LS_TODOS = "todo_cache_todos";
 const LS_CATS = "todo_cache_categories";
+const LS_ROUTINES = "todo_cache_routines";
 const LS_QUEUE = "todo_mutation_queue";
 
 function loadLS<T>(key: string, fallback: T): T {
@@ -119,7 +127,11 @@ const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
 // ─── Local notification scheduling ─────────────────────────────────────────────
 
-async function scheduleAllReminders(todos: Todo[], settings: AppSettings) {
+async function scheduleAllReminders(
+  todos: Todo[],
+  routines: Routine[],
+  settings: AppSettings,
+) {
   try {
     const pending = await LocalNotifications.getPending();
     if (pending.notifications.length) {
@@ -198,6 +210,63 @@ async function scheduleAllReminders(todos: Todo[], settings: AppSettings) {
     }
   }
 
+  // Routines have no fixed due date — their "deadline" is whichever
+  // occurrence is soonest from today, recomputed fresh right here (never
+  // cached), which is also what makes this naturally roll forward once an
+  // occurrence passes.
+  for (const routine of routines) {
+    const occurrence = nextOccurrence(routine);
+
+    for (const r of routine.reminders) {
+      if (!r.enabled) continue;
+
+      let notifyAt: Date;
+      let title: string;
+      let when: string;
+
+      if (r.remindAt) {
+        // Same shape as todos' custom reminders: fires exactly then.
+        notifyAt = new Date(r.remindAt);
+        title = "Reminder";
+        when = "now";
+      } else {
+        if (r.daysBefore === null) continue;
+
+        notifyAt = new Date(occurrence);
+        notifyAt.setDate(notifyAt.getDate() - r.daysBefore);
+        if (r.timeOfDay) {
+          const [hh, mm] = r.timeOfDay.split(":").map(Number);
+          notifyAt.setHours(hh, mm || 0, 0, 0);
+        } else {
+          notifyAt.setHours(9, 0, 0, 0);
+        }
+
+        const timeLabel = notifyAt.toLocaleTimeString([], {
+          hour: "numeric",
+          minute: "2-digit",
+        });
+        title = `${describeRecurrence(routine)} at ${timeLabel}`;
+        when = "now";
+      }
+
+      if (notifyAt.getTime() <= now) continue;
+
+      const template = r.message || "Reminder: {task}";
+
+      toSchedule.push({
+        // Routine reminders and todo reminders come from separate backend
+        // tables and can share numeric ids — offset routine notification
+        // ids well clear of any plausible todo reminder id to avoid one
+        // silently overwriting the other's scheduled notification.
+        id: 1_000_000 + r.id,
+        title,
+        body: template.replace("{task}", routine.task).replace("{when}", when),
+        schedule: { at: notifyAt },
+        channelId: "reminders",
+      });
+    }
+  }
+
   if (toSchedule.length) {
     try {
       await LocalNotifications.schedule({ notifications: toSchedule });
@@ -219,6 +288,9 @@ const PRESET_COLORS = [
   "#8b5cf6",
   "#14b8a6",
 ];
+
+const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_DAYS = Array.from({ length: 31 }, (_, i) => i + 1);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -283,6 +355,9 @@ export default function App({
   const [categories, setCategories] = useState<Category[]>(() =>
     loadLS<Category[]>(LS_CATS, []),
   );
+  const [routines, setRoutines] = useState<Routine[]>(() =>
+    loadLS<Routine[]>(LS_ROUTINES, []),
+  );
   // Categories are per-user — ids are no longer stable across accounts, so
   // the "My Tasks" / "Favourite" categories are identified by their `kind`
   // field rather than a hardcoded id.
@@ -339,6 +414,25 @@ export default function App({
   const [newReminderDays, setNewReminderDays] = useState("");
   const [newReminderCustom, setNewReminderCustom] = useState("");
   const [newReminderMsg, setNewReminderMsg] = useState("");
+
+  // New task/routine modal — Task vs Routine toggle. Only the "New Task"
+  // modal's own entry points (FAB, category sheet's "+ Add task"/"+ Create
+  // routine") ever set this; it isn't reset on cancel, matching the
+  // existing (un-reset) task/dueDate fields' behavior on Cancel.
+  const [addMode, setAddMode] = useState<"task" | "routine">("task");
+  const [routineRecurrenceType, setRoutineRecurrenceType] = useState<
+    "weekly" | "monthly"
+  >("weekly");
+  const [routineDaysOfWeek, setRoutineDaysOfWeek] = useState<number[]>([]);
+  const [routineDaysOfMonth, setRoutineDaysOfMonth] = useState<number[]>([]);
+  const [routineReminderMode, setRoutineReminderMode] = useState<
+    "days" | "custom"
+  >("days");
+  const [routineReminderDays, setRoutineReminderDays] = useState("");
+  const [routineReminderCustom, setRoutineReminderCustom] = useState("");
+  const [routineReminderTimeOfDay, setRoutineReminderTimeOfDay] =
+    useState("");
+  const [routineReminderMsg, setRoutineReminderMsg] = useState("");
 
   // Sidebar
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -398,6 +492,16 @@ export default function App({
   const [editDue, setEditDue] = useState("");
   const [editCatIdState, setEditCatIdState] = useState<number>(1);
 
+  // Routines — expand/edit state
+  const [expandedRoutines, setExpandedRoutines] = useState<Set<number>>(
+    new Set(),
+  );
+  const [editRoutineTarget, setEditRoutineTarget] = useState<Routine | null>(
+    null,
+  );
+  const [editRoutineTask, setEditRoutineTask] = useState("");
+  const [editRoutineCatId, setEditRoutineCatId] = useState<number>(0);
+
   // Pull to refresh
   const [refreshing, setRefreshing] = useState(false);
   const startY = useRef(0);
@@ -423,6 +527,9 @@ export default function App({
     saveLS(LS_CATS, categories);
   }, [categories]);
   useEffect(() => {
+    saveLS(LS_ROUTINES, routines);
+  }, [routines]);
+  useEffect(() => {
     queueRef.current = queue;
     saveLS(LS_QUEUE, queue);
   }, [queue]);
@@ -446,12 +553,14 @@ export default function App({
   // ── Data ──────────────────────────────────────────────────────────────────
 
   const fetchAll = useCallback(async () => {
-    const [tr, cr] = await Promise.all([
+    const [tr, cr, rr] = await Promise.all([
       axios.get<Todo[]>(`${API}/todos`),
       axios.get<Category[]>(`${API}/categories`),
+      axios.get<Routine[]>(`${API}/routines`),
     ]);
     setTodos(tr.data);
     setCategories(cr.data);
+    setRoutines(rr.data);
     setNewCatId((p) => {
       // default to first non-favourite category (still uninitialized)
       if (p === 0 && cr.data.length) {
@@ -590,8 +699,8 @@ export default function App({
 
   useEffect(() => {
     if (notifPermission !== "granted") return;
-    scheduleAllReminders(todos, settings).catch(() => {});
-  }, [todos, settings, notifPermission]);
+    scheduleAllReminders(todos, routines, settings).catch(() => {});
+  }, [todos, routines, settings, notifPermission]);
 
   // ── Per-task reminders (online-only) ─────────────────────────────────────
 
@@ -607,6 +716,23 @@ export default function App({
     [id: number]: string;
   }>({});
   const [reminderMsgInput, setReminderMsgInput] = useState<{
+    [id: number]: string;
+  }>({});
+
+  // Per-routine-row reminder inputs (expanded panel) — separate state from
+  // the New Task/Routine modal's own routineReminder* fields above, which
+  // only apply to the reminder created alongside a brand-new routine.
+  const [routineReminderModeInput, setRoutineReminderModeInput] = useState<{
+    [id: number]: "days" | "custom";
+  }>({});
+  const [routineReminderDaysInput, setRoutineReminderDaysInput] = useState<{
+    [id: number]: string;
+  }>({});
+  const [routineReminderCustomInput, setRoutineReminderCustomInput] =
+    useState<{ [id: number]: string }>({});
+  const [routineReminderTimeOfDayInput, setRoutineReminderTimeOfDayInput] =
+    useState<{ [id: number]: string }>({});
+  const [routineReminderMsgInput, setRoutineReminderMsgInput] = useState<{
     [id: number]: string;
   }>({});
 
@@ -669,6 +795,261 @@ export default function App({
     );
     setTodos((p) => p.map((t) => (t.id === todoId ? res.data : t)));
   };
+
+  // ── Routines (online-only — same "no offline queue" treatment as the
+  // per-task reminders/subtasks above; a routine's identity is entirely
+  // server-side, there's no meaningful optimistic-offline version of it) ──
+
+  const addRoutine = async (payload: {
+    task: string;
+    categoryId: number;
+    recurrenceType: "weekly" | "monthly";
+    daysOfWeek?: number[];
+    daysOfMonth?: number[];
+  }): Promise<Routine> => {
+    const res = await axios.post<Routine>(`${API}/routines`, payload);
+    setRoutines((p) => [...p, res.data]);
+    return res.data;
+  };
+
+  const updateRoutine = async (
+    id: number,
+    changes: Partial<{
+      task: string;
+      categoryId: number;
+      favourited: boolean;
+    }>,
+  ) => {
+    if (!isOnline) return;
+    const res = await axios.patch<Routine>(`${API}/routines/${id}`, changes);
+    setRoutines((p) => p.map((r) => (r.id === id ? res.data : r)));
+  };
+
+  const deleteRoutine = async (id: number) => {
+    if (!isOnline) return;
+    await axios.delete(`${API}/routines/${id}`);
+    setRoutines((p) => p.filter((r) => r.id !== id));
+    setExpandedRoutines((s) => {
+      const n = new Set(s);
+      n.delete(id);
+      return n;
+    });
+  };
+
+  const completeRoutineOccurrence = async (routineId: number, date: Date) => {
+    if (!isOnline) return;
+    const res = await axios.post<Routine>(
+      `${API}/routines/${routineId}/complete`,
+      { occurrenceDate: occurrenceDateKey(date) },
+    );
+    setRoutines((p) => p.map((r) => (r.id === routineId ? res.data : r)));
+  };
+
+  const uncompleteRoutineOccurrence = async (
+    routineId: number,
+    date: Date,
+  ) => {
+    if (!isOnline) return;
+    const res = await axios.delete<Routine>(
+      `${API}/routines/${routineId}/complete`,
+      { data: { occurrenceDate: occurrenceDateKey(date) } },
+    );
+    setRoutines((p) => p.map((r) => (r.id === routineId ? res.data : r)));
+  };
+
+  const postRoutineReminder = async (
+    routineId: number,
+    payload: {
+      daysBefore?: number;
+      remindAt?: string;
+      timeOfDay?: string;
+      message?: string;
+    },
+  ) => {
+    const res = await axios.post<Routine>(
+      `${API}/routines/${routineId}/reminders`,
+      payload,
+    );
+    setRoutines((p) => p.map((r) => (r.id === routineId ? res.data : r)));
+  };
+
+  const addRoutineReminder = async (routine: Routine) => {
+    const routineId = routine.id;
+    if (!isOnline) return;
+    const mode = routineReminderModeInput[routineId] ?? "days";
+    const message = routineReminderMsgInput[routineId]?.trim() || undefined;
+
+    if (mode === "custom") {
+      const raw = routineReminderCustomInput[routineId];
+      if (!raw) return;
+      const when = new Date(raw);
+      if (Number.isNaN(when.getTime())) return;
+      await postRoutineReminder(routineId, {
+        remindAt: when.toISOString(),
+        message,
+      });
+    } else {
+      const days = parseInt(routineReminderDaysInput[routineId] ?? "0", 10);
+      if (Number.isNaN(days) || days < 0) return;
+      const timeOfDay = routineReminderTimeOfDayInput[routineId] || undefined;
+      await postRoutineReminder(routineId, {
+        daysBefore: days,
+        timeOfDay,
+        message,
+      });
+    }
+
+    setRoutineReminderDaysInput((p) => ({ ...p, [routineId]: "" }));
+    setRoutineReminderCustomInput((p) => ({ ...p, [routineId]: "" }));
+    setRoutineReminderTimeOfDayInput((p) => ({ ...p, [routineId]: "" }));
+    setRoutineReminderMsgInput((p) => ({ ...p, [routineId]: "" }));
+  };
+
+  const toggleRoutineReminder = async (
+    routineId: number,
+    reminderId: number,
+    enabled: boolean,
+  ) => {
+    if (!isOnline) return;
+    const res = await axios.patch<Routine>(
+      `${API}/routines/${routineId}/reminders/${reminderId}`,
+      { enabled: !enabled },
+    );
+    setRoutines((p) => p.map((r) => (r.id === routineId ? res.data : r)));
+  };
+
+  const editRoutineReminderMessage = async (
+    routineId: number,
+    reminderId: number,
+    message: string,
+  ) => {
+    if (!isOnline) return;
+    const res = await axios.patch<Routine>(
+      `${API}/routines/${routineId}/reminders/${reminderId}`,
+      { message },
+    );
+    setRoutines((p) => p.map((r) => (r.id === routineId ? res.data : r)));
+  };
+
+  const deleteRoutineReminder = async (
+    routineId: number,
+    reminderId: number,
+  ) => {
+    if (!isOnline) return;
+    const res = await axios.delete<Routine>(
+      `${API}/routines/${routineId}/reminders/${reminderId}`,
+    );
+    setRoutines((p) => p.map((r) => (r.id === routineId ? res.data : r)));
+  };
+
+  const toggleRoutineDayOfWeek = (day: number) =>
+    setRoutineDaysOfWeek((p) =>
+      p.includes(day) ? p.filter((d) => d !== day) : [...p, day],
+    );
+  const toggleRoutineDayOfMonth = (day: number) =>
+    setRoutineDaysOfMonth((p) =>
+      p.includes(day) ? p.filter((d) => d !== day) : [...p, day],
+    );
+
+  const resetRoutineForm = () => {
+    setTask("");
+    setAddMode("task");
+    setRoutineRecurrenceType("weekly");
+    setRoutineDaysOfWeek([]);
+    setRoutineDaysOfMonth([]);
+    setRoutineReminderMode("days");
+    setRoutineReminderDays("");
+    setRoutineReminderCustom("");
+    setRoutineReminderTimeOfDay("");
+    setRoutineReminderMsg("");
+  };
+
+  // Validates + creates a routine (and its optional starter reminder) for
+  // the "New Task" modal's Routine mode. Returns whether it actually
+  // submitted — false means "silently did nothing", mirroring this app's
+  // existing no-toast validation style — so the caller only closes/resets
+  // the modal on an actual success instead of blindly matching addTodo()'s
+  // unconditional close (addTodo has no visible symptom when it no-ops
+  // since the task field is empty either way; a half-filled routine form
+  // deserves to stay open so the user can fix it).
+  const submitRoutine = async (): Promise<boolean> => {
+    if (!task.trim() || !isOnline) return false;
+    const targetCat = newCatId;
+    if (targetCat === favouriteCatId) return false;
+    if (
+      routineRecurrenceType === "weekly"
+        ? routineDaysOfWeek.length === 0
+        : routineDaysOfMonth.length === 0
+    ) {
+      return false;
+    }
+
+    const created = await addRoutine(
+      routineRecurrenceType === "weekly"
+        ? {
+            task: task.trim(),
+            categoryId: targetCat,
+            recurrenceType: "weekly",
+            daysOfWeek: routineDaysOfWeek,
+          }
+        : {
+            task: task.trim(),
+            categoryId: targetCat,
+            recurrenceType: "monthly",
+            daysOfMonth: routineDaysOfMonth,
+          },
+    );
+
+    const message = routineReminderMsg.trim() || undefined;
+    if (routineReminderMode === "custom" && routineReminderCustom) {
+      const when = new Date(routineReminderCustom);
+      if (!Number.isNaN(when.getTime())) {
+        await postRoutineReminder(created.id, {
+          remindAt: when.toISOString(),
+          message,
+        });
+      }
+    } else if (routineReminderMode === "days" && routineReminderDays !== "") {
+      const days = parseInt(routineReminderDays, 10);
+      if (!Number.isNaN(days) && days >= 0) {
+        await postRoutineReminder(created.id, {
+          daysBefore: days,
+          timeOfDay: routineReminderTimeOfDay || undefined,
+          message,
+        });
+      }
+    }
+
+    resetRoutineForm();
+    return true;
+  };
+
+  const openEditRoutine = (r: Routine) => {
+    setEditRoutineTarget(r);
+    setEditRoutineTask(r.task);
+    setEditRoutineCatId(
+      r.categoryId === favouriteCatId
+        ? (defaultCatId ?? r.categoryId)
+        : r.categoryId,
+    );
+  };
+
+  const saveEditRoutine = async () => {
+    if (!editRoutineTarget || !editRoutineTask.trim() || !isOnline) return;
+    await updateRoutine(editRoutineTarget.id, {
+      task: editRoutineTask.trim(),
+      categoryId: editRoutineCatId,
+    });
+    setEditRoutineTarget(null);
+  };
+
+  const toggleRoutineExpand = (id: number) =>
+    setExpandedRoutines((s) => {
+      const n = new Set(s);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
 
   async function syncQueue() {
     if (syncingRef.current) return;
@@ -847,6 +1228,18 @@ export default function App({
 
     return filtered; // "all"
   })();
+
+  // Routines get their own category/favourite scoping, mirroring
+  // visibleTodos/baseFiltered above — no status/pending sub-filters apply
+  // to them since a routine's "done" state is per-occurrence, not a single
+  // completed flag.
+  const visibleRoutines = (() => {
+    if (activeCatId === null) return routines;
+    if (activeCatId === favouriteCatId)
+      return routines.filter((r) => r.favourited);
+    return routines.filter((r) => r.categoryId === activeCatId);
+  })();
+
   // ── Todo CRUD ─────────────────────────────────────────────────────────────
 
   const optimisticTodo = (
@@ -1456,11 +1849,23 @@ export default function App({
                 className="btn-primary"
                 onClick={() => {
                   setNewCatId(catActionsTarget.id);
+                  setAddMode("task");
                   setShowAddModal(true);
                   setCatActionsTarget(null);
                 }}
               >
                 + Add task
+              </button>
+              <button
+                className="btn-primary"
+                onClick={() => {
+                  setNewCatId(catActionsTarget.id);
+                  setAddMode("routine");
+                  setShowAddModal(true);
+                  setCatActionsTarget(null);
+                }}
+              >
+                + Create routine
               </button>
               <button
                 className="btn-danger"
@@ -2402,11 +2807,328 @@ export default function App({
             })}
           </ul>
 
+          {/* Routines — rendered separately from the todo list above since
+              a Routine isn't a Todo (no fixed due date, no subtasks; its
+              "done" state is per-occurrence). Skipped entirely when there
+              are none in scope, matching this app's no-empty-scaffolding
+              instinct elsewhere. */}
+          {visibleRoutines.length > 0 && (
+            <div className="routines-section">
+              <h2 className="routines-title">Routines</h2>
+              <ul className="todo-list">
+                {visibleRoutines.map((routine) => {
+                  const cat = getCat(routine.categoryId);
+                  const occurrence = nextOccurrence(routine);
+                  const done = isOccurrenceDone(routine, occurrence);
+                  const isExp = expandedRoutines.has(routine.id);
+                  const rMode = routineReminderModeInput[routine.id] ?? "days";
+                  const mKey = `routine-${routine.id}`;
+
+                  return (
+                    <li
+                      key={routine.id}
+                      className={`todo-card${isExp ? " exp" : ""}${routine.favourited ? " is-fav" : ""}`}
+                    >
+                      <div className="todo-top">
+                        <button
+                          className={`check-btn${done ? " checked" : ""}`}
+                          disabled={!isOnline}
+                          title={
+                            !isOnline
+                              ? "Connect to the internet to update routines"
+                              : done
+                                ? "Mark not done"
+                                : "Mark done"
+                          }
+                          onClick={() =>
+                            done
+                              ? uncompleteRoutineOccurrence(
+                                  routine.id,
+                                  occurrence,
+                                )
+                              : completeRoutineOccurrence(
+                                  routine.id,
+                                  occurrence,
+                                )
+                          }
+                        >
+                          {done ? "✓" : ""}
+                        </button>
+
+                        <div
+                          className="todo-body"
+                          style={{ cursor: "pointer" }}
+                          onClick={() => toggleRoutineExpand(routine.id)}
+                        >
+                          <div className="todo-title-row">
+                            <span className="todo-text">{routine.task}</span>
+                            <span
+                              className={`expand-arrow${isExp ? " open" : ""}`}
+                            >
+                              ›
+                            </span>
+                          </div>
+                          <div className="todo-meta">
+                            {cat && cat.id !== favouriteCatId && (
+                              <span
+                                className="meta-tag"
+                                style={{
+                                  background: cat.color + "20",
+                                  color: cat.color,
+                                }}
+                              >
+                                <ColorDot color={cat.color} /> {cat.name}
+                              </span>
+                            )}
+                            <span className="meta-tag">
+                              🔁 {describeRecurrence(routine)}
+                            </span>
+                            <span className="meta-tag">
+                              📅 {fmt(occurrence.toISOString())}
+                            </span>
+                          </div>
+                        </div>
+
+                        <StarButton
+                          favourited={routine.favourited}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            updateRoutine(routine.id, {
+                              favourited: !routine.favourited,
+                            });
+                          }}
+                        />
+
+                        <div
+                          className="todo-menu-wrap"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <button
+                            className="dots-btn main"
+                            onClick={(e) => openCtx(mKey, e.currentTarget)}
+                          >
+                            ···
+                          </button>
+                          {openMenu === mKey && (
+                            <ContextMenu
+                              anchorRef={menuAnchorRef}
+                              onClose={() => setOpenMenu(null)}
+                              items={[
+                                {
+                                  label: "Edit",
+                                  icon: "✎",
+                                  onClick: () => openEditRoutine(routine),
+                                },
+                                {
+                                  label: "Delete",
+                                  icon: "✕",
+                                  danger: true,
+                                  onClick: () => deleteRoutine(routine.id),
+                                },
+                              ]}
+                            />
+                          )}
+                        </div>
+                      </div>
+
+                      {isExp && (
+                        <div className="exp-panel">
+                          <div className="exp-section">
+                            <span className="exp-label">Reminders</span>
+
+                            <ul className="subtask-list">
+                              {routine.reminders.length === 0 && (
+                                <li className="sub-empty">No reminders</li>
+                              )}
+
+                              {routine.reminders.map((r) => (
+                                <li key={r.id} className="reminder-item">
+                                  <button
+                                    className={`check-btn small${r.enabled ? " checked" : ""}`}
+                                    title={r.enabled ? "Enabled" : "Disabled"}
+                                    onClick={() =>
+                                      toggleRoutineReminder(
+                                        routine.id,
+                                        r.id,
+                                        r.enabled,
+                                      )
+                                    }
+                                  >
+                                    {r.enabled ? "✓" : ""}
+                                  </button>
+
+                                  <span className="reminder-when">
+                                    {r.remindAt
+                                      ? new Date(r.remindAt).toLocaleString(
+                                          [],
+                                          {
+                                            day: "numeric",
+                                            month: "short",
+                                            hour: "numeric",
+                                            minute: "2-digit",
+                                          },
+                                        )
+                                      : `${r.daysBefore}d before${r.timeOfDay ? ` @ ${r.timeOfDay.slice(0, 5)}` : ""}`}
+                                  </span>
+
+                                  <input
+                                    className="reminder-msg-input"
+                                    placeholder="Reminder: {task}"
+                                    defaultValue={r.message ?? ""}
+                                    onBlur={(e) =>
+                                      e.target.value.trim() !==
+                                        (r.message ?? "") &&
+                                      editRoutineReminderMessage(
+                                        routine.id,
+                                        r.id,
+                                        e.target.value,
+                                      )
+                                    }
+                                  />
+
+                                  <button
+                                    className="icon-btn danger sm"
+                                    onClick={() =>
+                                      deleteRoutineReminder(routine.id, r.id)
+                                    }
+                                  >
+                                    ✕
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+
+                            <div className="subtask-add reminder-add">
+                              <div className="reminder-mode-toggle">
+                                <button
+                                  className={`reminder-mode-btn${rMode === "days" ? " active" : ""}`}
+                                  onClick={() =>
+                                    setRoutineReminderModeInput((p) => ({
+                                      ...p,
+                                      [routine.id]: "days",
+                                    }))
+                                  }
+                                >
+                                  Days before
+                                </button>
+                                <button
+                                  className={`reminder-mode-btn${rMode === "custom" ? " active" : ""}`}
+                                  onClick={() =>
+                                    setRoutineReminderModeInput((p) => ({
+                                      ...p,
+                                      [routine.id]: "custom",
+                                    }))
+                                  }
+                                >
+                                  Custom date &amp; time
+                                </button>
+                              </div>
+
+                              <div className="reminder-add-row">
+                                {rMode === "custom" ? (
+                                  <input
+                                    type="datetime-local"
+                                    className="form-input reminder-days-input"
+                                    value={
+                                      routineReminderCustomInput[
+                                        routine.id
+                                      ] ?? ""
+                                    }
+                                    onChange={(e) =>
+                                      setRoutineReminderCustomInput((p) => ({
+                                        ...p,
+                                        [routine.id]: e.target.value,
+                                      }))
+                                    }
+                                  />
+                                ) : (
+                                  <>
+                                    <input
+                                      type="number"
+                                      min={0}
+                                      className="form-input reminder-days-input"
+                                      placeholder="Days before"
+                                      value={
+                                        routineReminderDaysInput[
+                                          routine.id
+                                        ] ?? ""
+                                      }
+                                      onChange={(e) =>
+                                        setRoutineReminderDaysInput((p) => ({
+                                          ...p,
+                                          [routine.id]: e.target.value,
+                                        }))
+                                      }
+                                    />
+                                    <input
+                                      type="time"
+                                      className="form-input"
+                                      style={{ width: 110 }}
+                                      title="Time (optional)"
+                                      value={
+                                        routineReminderTimeOfDayInput[
+                                          routine.id
+                                        ] ?? ""
+                                      }
+                                      onChange={(e) =>
+                                        setRoutineReminderTimeOfDayInput(
+                                          (p) => ({
+                                            ...p,
+                                            [routine.id]: e.target.value,
+                                          }),
+                                        )
+                                      }
+                                    />
+                                  </>
+                                )}
+                                <input
+                                  className="form-input subtask-input"
+                                  placeholder="Message (optional)…"
+                                  value={
+                                    routineReminderMsgInput[routine.id] ?? ""
+                                  }
+                                  onChange={(e) =>
+                                    setRoutineReminderMsgInput((p) => ({
+                                      ...p,
+                                      [routine.id]: e.target.value,
+                                    }))
+                                  }
+                                  onKeyDown={(e) =>
+                                    e.key === "Enter" &&
+                                    addRoutineReminder(routine)
+                                  }
+                                />
+                                <button
+                                  className="btn-sub-add"
+                                  onClick={() => addRoutineReminder(routine)}
+                                  disabled={!isOnline}
+                                  title={
+                                    !isOnline
+                                      ? "Connect to the internet to add reminders"
+                                      : "Add reminder"
+                                  }
+                                >
+                                  +
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
 
           {!isFavouriteView && (
   <button
     className="fab"
-    onClick={() => setShowAddModal(true)}
+    onClick={() => {
+      setAddMode("task");
+      setShowAddModal(true);
+    }}
     title="Add task"
   >
     +
@@ -2420,21 +3142,43 @@ export default function App({
     <div className="modal-box" onClick={(e) => e.stopPropagation()}>
       <h3 className="modal-title">New Task</h3>
 
+      <div className="reminder-mode-toggle">
+        <button
+          type="button"
+          className={`reminder-mode-btn${addMode === "task" ? " active" : ""}`}
+          onClick={() => setAddMode("task")}
+        >
+          Task
+        </button>
+        <button
+          type="button"
+          className={`reminder-mode-btn${addMode === "routine" ? " active" : ""}`}
+          onClick={() => setAddMode("routine")}
+        >
+          Routine
+        </button>
+      </div>
+
       <input
         className="modal-input"
         placeholder="What needs to be done?"
         value={task}
         autoFocus
         onChange={(e) => setTask(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && addTodo()}
+        onKeyDown={(e) =>
+          e.key === "Enter" &&
+          (addMode === "task" ? addTodo() : submitRoutine())
+        }
       />
 
-      <input
-        type="date"
-        className="modal-input"
-        value={dueDate}
-        onChange={(e) => setDueDate(e.target.value)}
-      />
+      {addMode === "task" && (
+        <input
+          type="date"
+          className="modal-input"
+          value={dueDate}
+          onChange={(e) => setDueDate(e.target.value)}
+        />
+      )}
 
       <select
   className="modal-input"
@@ -2452,7 +3196,7 @@ export default function App({
         ))}
       </select>
 
-      {isOnline && (
+      {addMode === "task" && isOnline && (
         <>
           {dueDate && (
             <div className="reminder-mode-toggle">
@@ -2499,11 +3243,126 @@ export default function App({
           </div>
         </>
       )}
-      {dueDate && !isOnline && (
+      {addMode === "task" && dueDate && !isOnline && (
         <p className="modal-desc">
           You'll get the default "due today" reminder once this task syncs —
           connect to add a custom one.
         </p>
+      )}
+
+      {addMode === "routine" && (
+        <>
+          <div className="reminder-mode-toggle">
+            <button
+              type="button"
+              className={`reminder-mode-btn${routineRecurrenceType === "weekly" ? " active" : ""}`}
+              onClick={() => setRoutineRecurrenceType("weekly")}
+            >
+              Weekly
+            </button>
+            <button
+              type="button"
+              className={`reminder-mode-btn${routineRecurrenceType === "monthly" ? " active" : ""}`}
+              onClick={() => setRoutineRecurrenceType("monthly")}
+            >
+              Monthly
+            </button>
+          </div>
+
+          {routineRecurrenceType === "weekly" ? (
+            <div className="chip-grid">
+              {WEEKDAY_LABELS.map((label, idx) => (
+                <button
+                  key={idx}
+                  type="button"
+                  className={`reminder-mode-btn${routineDaysOfWeek.includes(idx) ? " active" : ""}`}
+                  onClick={() => toggleRoutineDayOfWeek(idx)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="chip-grid">
+              {MONTH_DAYS.map((day) => (
+                <button
+                  key={day}
+                  type="button"
+                  className={`reminder-mode-btn${routineDaysOfMonth.includes(day) ? " active" : ""}`}
+                  onClick={() => toggleRoutineDayOfMonth(day)}
+                >
+                  {day}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {isOnline ? (
+            <>
+              <div className="reminder-mode-toggle">
+                <button
+                  type="button"
+                  className={`reminder-mode-btn${routineReminderMode === "days" ? " active" : ""}`}
+                  onClick={() => setRoutineReminderMode("days")}
+                >
+                  Days before
+                </button>
+                <button
+                  type="button"
+                  className={`reminder-mode-btn${routineReminderMode === "custom" ? " active" : ""}`}
+                  onClick={() => setRoutineReminderMode("custom")}
+                >
+                  Custom date &amp; time
+                </button>
+              </div>
+              <div className="new-reminder-row">
+                {routineReminderMode === "days" ? (
+                  <input
+                    type="number"
+                    min={0}
+                    className="form-input reminder-days-input"
+                    placeholder="Remind me: days before"
+                    value={routineReminderDays}
+                    onChange={(e) => setRoutineReminderDays(e.target.value)}
+                  />
+                ) : (
+                  <input
+                    type="datetime-local"
+                    className="form-input reminder-days-input"
+                    value={routineReminderCustom}
+                    onChange={(e) => setRoutineReminderCustom(e.target.value)}
+                  />
+                )}
+                <input
+                  className="modal-input"
+                  placeholder="Reminder message (optional)"
+                  value={routineReminderMsg}
+                  onChange={(e) => setRoutineReminderMsg(e.target.value)}
+                />
+              </div>
+              {routineReminderMode === "days" && (
+                <div className="new-reminder-row">
+                  <input
+                    type="time"
+                    className="form-input reminder-days-input"
+                    title="Time (optional)"
+                    value={routineReminderTimeOfDay}
+                    onChange={(e) =>
+                      setRoutineReminderTimeOfDay(e.target.value)
+                    }
+                  />
+                  <span className="modal-desc" style={{ margin: 0 }}>
+                    Time (optional) — defaults to 9:00 AM
+                  </span>
+                </div>
+              )}
+            </>
+          ) : (
+            <p className="modal-desc">
+              Routines require an internet connection to create.
+            </p>
+          )}
+        </>
       )}
 
       <div className="modal-actions">
@@ -2515,12 +3374,59 @@ export default function App({
         </button>
         <button
           className="btn-primary"
-          onClick={() => {
-            addTodo();
-            setShowAddModal(false);
+          disabled={addMode === "routine" && !isOnline}
+          onClick={async () => {
+            if (addMode === "task") {
+              addTodo();
+              setShowAddModal(false);
+            } else {
+              const ok = await submitRoutine();
+              if (ok) setShowAddModal(false);
+            }
           }}
         >
           Add
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+
+{editRoutineTarget && (
+  <div className="modal-overlay" onClick={() => setEditRoutineTarget(null)}>
+    <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+      <h3 className="modal-title">Edit Routine</h3>
+
+      <input
+        className="modal-input"
+        placeholder="What needs to be done?"
+        value={editRoutineTask}
+        autoFocus
+        onChange={(e) => setEditRoutineTask(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && saveEditRoutine()}
+      />
+
+      <select
+        className="modal-input"
+        value={editRoutineCatId}
+        onChange={(e) => setEditRoutineCatId(Number(e.target.value))}
+      >
+        {nonFavCats.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.name}
+          </option>
+        ))}
+      </select>
+
+      <div className="modal-actions">
+        <button
+          className="btn-ghost"
+          onClick={() => setEditRoutineTarget(null)}
+        >
+          Cancel
+        </button>
+        <button className="btn-primary" onClick={saveEditRoutine}>
+          Save
         </button>
       </div>
     </div>
@@ -2884,6 +3790,12 @@ const CSS = `
     color: var(--muted); cursor: pointer;
   }
   .reminder-mode-btn.active { border-color: var(--accent); color: var(--accent); background: var(--accent-light); }
+  .chip-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+
+  /* Routines section */
+  .routines-section { margin-top: 28px; }
+  .routines-title { font-family: var(--font-head); font-size: 15px; font-weight: 700; color: var(--text); margin-bottom: 10px; }
+
   .subtask-add.reminder-add { flex-direction: column; align-items: stretch; gap: 0; }
   .reminder-add-row { display: flex; gap: 6px; }
   .reminder-add-row .reminder-days-input { width: 150px; }
