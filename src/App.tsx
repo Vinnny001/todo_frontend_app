@@ -11,9 +11,13 @@ import { ContextMenu } from "./components/ContextMenu";
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Subtask = { id: number; task: string; completed: boolean };
+// Exactly one of daysBefore/remindAt is ever set (enforced server-side):
+// daysBefore counts back from the task's due date, remindAt is an absolute
+// date & time and works even when the task has no due date at all.
 type Reminder = {
   id: number;
-  daysBefore: number;
+  daysBefore: number | null;
+  remindAt: string | null;
   message: string | null;
   enabled: boolean;
 };
@@ -135,28 +139,57 @@ async function scheduleAllReminders(todos: Todo[], settings: AppSettings) {
   }[] = [];
 
   for (const todo of todos) {
-    if (todo.completed || !todo.dueDate || todo.id < 0) continue;
+    if (todo.completed || todo.id < 0) continue;
 
-    const due = new Date(todo.dueDate);
+    const due = todo.dueDate ? new Date(todo.dueDate) : null;
 
     for (const r of todo.reminders) {
       if (!r.enabled) continue;
 
-      const notifyAt = new Date(due);
-      notifyAt.setDate(notifyAt.getDate() - r.daysBefore);
-      notifyAt.setHours(9, 0, 0, 0);
+      let notifyAt: Date;
+      let title: string;
+      let when: string;
+
+      if (r.remindAt) {
+        // Custom date & time — fires exactly then, independent of any due date.
+        notifyAt = new Date(r.remindAt);
+        title = "Reminder";
+        when = "now";
+      } else {
+        // "Days before" only makes sense relative to a due date (the
+        // server won't create one without a due date either).
+        if (!due || r.daysBefore === null) continue;
+
+        notifyAt = new Date(due);
+        notifyAt.setDate(notifyAt.getDate() - r.daysBefore);
+        notifyAt.setHours(9, 0, 0, 0);
+
+        when =
+          r.daysBefore === 0
+            ? "today"
+            : r.daysBefore === 1
+              ? "tomorrow"
+              : `in ${r.daysBefore} days`;
+        title =
+          r.daysBefore === 0
+            ? "Task due today"
+            : r.daysBefore === 1
+              ? "Task due tomorrow"
+              : `Task due in ${r.daysBefore} days`;
+      }
+
       if (notifyAt.getTime() <= now) continue;
 
       const template =
-        r.message || settings.defaultReminderMessage || 'Task "{task}" is due today!';
+        r.message ||
+        (r.remindAt
+          ? "Reminder: {task}"
+          : settings.defaultReminderMessage || 'Task "{task}" is due {when}!');
 
       toSchedule.push({
         id: r.id,
-        title:
-          r.daysBefore === 0
-            ? "Task due today"
-            : `Task due in ${r.daysBefore} day${r.daysBefore === 1 ? "" : "s"}`,
-        body: template.replace("{task}", todo.task),
+        title,
+        body: template.replace("{task}", todo.task).replace("{when}", when),
         schedule: { at: notifyAt },
       });
     }
@@ -297,7 +330,11 @@ export default function App({
   // category (unlike the old hardcoded `1`, which broke for any user whose
   // "My Tasks" category wasn't literally id 1).
   const [newCatId, setNewCatId] = useState<number>(0);
+  const [newReminderMode, setNewReminderMode] = useState<"days" | "custom">(
+    "days",
+  );
   const [newReminderDays, setNewReminderDays] = useState("");
+  const [newReminderCustom, setNewReminderCustom] = useState("");
   const [newReminderMsg, setNewReminderMsg] = useState("");
 
   // Sidebar
@@ -373,7 +410,7 @@ export default function App({
 
   const [settings, setSettings] = useState<AppSettings>({
     notifyDueTodayEnabled: true,
-    defaultReminderMessage: 'Task "{task}" is due today!',
+    defaultReminderMessage: 'Task "{task}" is due {when}!',
   });
   const [notifPermission, setNotifPermission] =
     useState<PermissionStatus["display"]>("prompt");
@@ -499,25 +536,44 @@ export default function App({
 
   // ── Per-task reminders (online-only) ─────────────────────────────────────
 
+  // "days": the existing days-before-due-date method (needs a due date).
+  // "custom": an absolute date & time — works even with no due date.
+  const [reminderModeInput, setReminderModeInput] = useState<{
+    [id: number]: "days" | "custom";
+  }>({});
   const [reminderDaysInput, setReminderDaysInput] = useState<{
+    [id: number]: string;
+  }>({});
+  const [reminderCustomInput, setReminderCustomInput] = useState<{
     [id: number]: string;
   }>({});
   const [reminderMsgInput, setReminderMsgInput] = useState<{
     [id: number]: string;
   }>({});
 
-  const addReminder = async (todoId: number) => {
+  const addReminder = async (todo: Todo) => {
+    const todoId = todo.id;
     if (!isOnline || todoId < 0) return;
-    const days = parseInt(reminderDaysInput[todoId] ?? "0", 10);
-    if (Number.isNaN(days) || days < 0) return;
+    const mode = reminderModeInput[todoId] ?? (todo.dueDate ? "days" : "custom");
     const message = reminderMsgInput[todoId]?.trim() || undefined;
 
-    const res = await axios.post<Todo>(`${API}/todos/${todoId}/reminders`, {
-      daysBefore: days,
-      message,
-    });
+    let payload: { daysBefore?: number; remindAt?: string; message?: string };
+    if (mode === "custom") {
+      const raw = reminderCustomInput[todoId];
+      if (!raw) return;
+      const when = new Date(raw);
+      if (Number.isNaN(when.getTime())) return;
+      payload = { remindAt: when.toISOString(), message };
+    } else {
+      const days = parseInt(reminderDaysInput[todoId] ?? "0", 10);
+      if (Number.isNaN(days) || days < 0) return;
+      payload = { daysBefore: days, message };
+    }
+
+    const res = await axios.post<Todo>(`${API}/todos/${todoId}/reminders`, payload);
     setTodos((p) => p.map((t) => (t.id === todoId ? res.data : t)));
     setReminderDaysInput((p) => ({ ...p, [todoId]: "" }));
+    setReminderCustomInput((p) => ({ ...p, [todoId]: "" }));
     setReminderMsgInput((p) => ({ ...p, [todoId]: "" }));
   };
 
@@ -761,15 +817,34 @@ export default function App({
     };
     // Reminders are online-only (see the offline banner) — a queued offline
     // create still gets the default "due today" reminder once it syncs.
-    const days = parseInt(newReminderDays, 10);
-    const reminderPayload =
-      payload.dueDate && !Number.isNaN(days) && days >= 0
-        ? { reminderDaysBefore: days, reminderMessage: newReminderMsg.trim() || undefined }
-        : {};
+    // Custom date & time works with or without a due date; "days before"
+    // only applies when a due date is set.
+    const reminderMessage = newReminderMsg.trim() || undefined;
+    // Mirrors the form's own rendering rule: without a due date, "days
+    // before" isn't even shown, so custom is the only real option there.
+    const effectiveReminderMode = payload.dueDate ? newReminderMode : "custom";
+    let reminderPayload: {
+      reminderDaysBefore?: number;
+      reminderRemindAt?: string;
+      reminderMessage?: string;
+    } = {};
+    if (effectiveReminderMode === "custom" && newReminderCustom) {
+      const when = new Date(newReminderCustom);
+      if (!Number.isNaN(when.getTime())) {
+        reminderPayload = { reminderRemindAt: when.toISOString(), reminderMessage };
+      }
+    } else if (effectiveReminderMode === "days" && payload.dueDate) {
+      const days = parseInt(newReminderDays, 10);
+      if (!Number.isNaN(days) && days >= 0) {
+        reminderPayload = { reminderDaysBefore: days, reminderMessage };
+      }
+    }
     const resetForm = () => {
       setTask("");
       setDueDate("");
+      setNewReminderMode("days");
       setNewReminderDays("");
+      setNewReminderCustom("");
       setNewReminderMsg("");
     };
 
@@ -2069,7 +2144,11 @@ export default function App({
                         </div>
                       </div>
 
-                      {todo.dueDate && (
+                      {(() => {
+                        const mode =
+                          reminderModeInput[todo.id] ??
+                          (todo.dueDate ? "days" : "custom");
+                        return (
                         <div className="exp-section">
                           <span className="exp-label">Reminders</span>
 
@@ -2091,9 +2170,16 @@ export default function App({
                                 </button>
 
                                 <span className="reminder-when">
-                                  {r.daysBefore === 0
-                                    ? "Due today"
-                                    : `${r.daysBefore}d before`}
+                                  {r.remindAt
+                                    ? new Date(r.remindAt).toLocaleString([], {
+                                        day: "numeric",
+                                        month: "short",
+                                        hour: "numeric",
+                                        minute: "2-digit",
+                                      })
+                                    : r.daysBefore === 0
+                                      ? "Due today"
+                                      : `${r.daysBefore}d before`}
                                 </span>
 
                                 <input
@@ -2120,49 +2206,93 @@ export default function App({
                             ))}
                           </ul>
 
-                          <div className="subtask-add">
-                            <input
-                              type="number"
-                              min={0}
-                              className="form-input reminder-days-input"
-                              placeholder="Days before"
-                              value={reminderDaysInput[todo.id] ?? ""}
-                              onChange={(e) =>
-                                setReminderDaysInput((p) => ({
-                                  ...p,
-                                  [todo.id]: e.target.value,
-                                }))
-                              }
-                            />
-                            <input
-                              className="form-input subtask-input"
-                              placeholder="Message (optional)…"
-                              value={reminderMsgInput[todo.id] ?? ""}
-                              onChange={(e) =>
-                                setReminderMsgInput((p) => ({
-                                  ...p,
-                                  [todo.id]: e.target.value,
-                                }))
-                              }
-                              onKeyDown={(e) =>
-                                e.key === "Enter" && addReminder(todo.id)
-                              }
-                            />
-                            <button
-                              className="btn-sub-add"
-                              onClick={() => addReminder(todo.id)}
-                              disabled={!isOnline || todo.id < 0}
-                              title={
-                                !isOnline || todo.id < 0
-                                  ? "Connect to the internet to add reminders"
-                                  : "Add reminder"
-                              }
-                            >
-                              +
-                            </button>
+                          <div className="subtask-add reminder-add">
+                            {todo.dueDate && (
+                              <div className="reminder-mode-toggle">
+                                <button
+                                  className={`reminder-mode-btn${mode === "days" ? " active" : ""}`}
+                                  onClick={() =>
+                                    setReminderModeInput((p) => ({
+                                      ...p,
+                                      [todo.id]: "days",
+                                    }))
+                                  }
+                                >
+                                  Days before
+                                </button>
+                                <button
+                                  className={`reminder-mode-btn${mode === "custom" ? " active" : ""}`}
+                                  onClick={() =>
+                                    setReminderModeInput((p) => ({
+                                      ...p,
+                                      [todo.id]: "custom",
+                                    }))
+                                  }
+                                >
+                                  Custom date &amp; time
+                                </button>
+                              </div>
+                            )}
+
+                            <div className="reminder-add-row">
+                              {mode === "custom" ? (
+                                <input
+                                  type="datetime-local"
+                                  className="form-input reminder-days-input"
+                                  value={reminderCustomInput[todo.id] ?? ""}
+                                  onChange={(e) =>
+                                    setReminderCustomInput((p) => ({
+                                      ...p,
+                                      [todo.id]: e.target.value,
+                                    }))
+                                  }
+                                />
+                              ) : (
+                                <input
+                                  type="number"
+                                  min={0}
+                                  className="form-input reminder-days-input"
+                                  placeholder="Days before"
+                                  value={reminderDaysInput[todo.id] ?? ""}
+                                  onChange={(e) =>
+                                    setReminderDaysInput((p) => ({
+                                      ...p,
+                                      [todo.id]: e.target.value,
+                                    }))
+                                  }
+                                />
+                              )}
+                              <input
+                                className="form-input subtask-input"
+                                placeholder="Message (optional)…"
+                                value={reminderMsgInput[todo.id] ?? ""}
+                                onChange={(e) =>
+                                  setReminderMsgInput((p) => ({
+                                    ...p,
+                                    [todo.id]: e.target.value,
+                                  }))
+                                }
+                                onKeyDown={(e) =>
+                                  e.key === "Enter" && addReminder(todo)
+                                }
+                              />
+                              <button
+                                className="btn-sub-add"
+                                onClick={() => addReminder(todo)}
+                                disabled={!isOnline || todo.id < 0}
+                                title={
+                                  !isOnline || todo.id < 0
+                                    ? "Connect to the internet to add reminders"
+                                    : "Add reminder"
+                                }
+                              >
+                                +
+                              </button>
+                            </div>
                           </div>
                         </div>
-                      )}
+                        );
+                      })()}
                     </div>
                   )}
                 </li>
@@ -2220,23 +2350,52 @@ export default function App({
         ))}
       </select>
 
-      {dueDate && isOnline && (
-        <div className="new-reminder-row">
-          <input
-            type="number"
-            min={0}
-            className="form-input reminder-days-input"
-            placeholder="Remind me: days before"
-            value={newReminderDays}
-            onChange={(e) => setNewReminderDays(e.target.value)}
-          />
-          <input
-            className="modal-input"
-            placeholder="Reminder message (optional)"
-            value={newReminderMsg}
-            onChange={(e) => setNewReminderMsg(e.target.value)}
-          />
-        </div>
+      {isOnline && (
+        <>
+          {dueDate && (
+            <div className="reminder-mode-toggle">
+              <button
+                type="button"
+                className={`reminder-mode-btn${newReminderMode === "days" ? " active" : ""}`}
+                onClick={() => setNewReminderMode("days")}
+              >
+                Days before
+              </button>
+              <button
+                type="button"
+                className={`reminder-mode-btn${newReminderMode === "custom" ? " active" : ""}`}
+                onClick={() => setNewReminderMode("custom")}
+              >
+                Custom date &amp; time
+              </button>
+            </div>
+          )}
+          <div className="new-reminder-row">
+            {dueDate && newReminderMode === "days" ? (
+              <input
+                type="number"
+                min={0}
+                className="form-input reminder-days-input"
+                placeholder="Remind me: days before"
+                value={newReminderDays}
+                onChange={(e) => setNewReminderDays(e.target.value)}
+              />
+            ) : (
+              <input
+                type="datetime-local"
+                className="form-input reminder-days-input"
+                value={newReminderCustom}
+                onChange={(e) => setNewReminderCustom(e.target.value)}
+              />
+            )}
+            <input
+              className="modal-input"
+              placeholder="Reminder message (optional)"
+              value={newReminderMsg}
+              onChange={(e) => setNewReminderMsg(e.target.value)}
+            />
+          </div>
+        </>
       )}
       {dueDate && !isOnline && (
         <p className="modal-desc">
@@ -2601,6 +2760,16 @@ const CSS = `
   }
   .reminder-msg-input:focus { border-color: var(--accent); }
   .reminder-days-input { width: 90px; flex-shrink: 0; }
+  .reminder-mode-toggle { display: flex; gap: 6px; margin-bottom: 8px; }
+  .reminder-mode-btn {
+    font-family: var(--font-body); font-size: 11.5px; padding: 5px 10px;
+    border: 1px solid var(--border); border-radius: 20px; background: var(--surface);
+    color: var(--muted); cursor: pointer;
+  }
+  .reminder-mode-btn.active { border-color: var(--accent); color: var(--accent); background: var(--accent-light); }
+  .subtask-add.reminder-add { flex-direction: column; align-items: stretch; gap: 0; }
+  .reminder-add-row { display: flex; gap: 6px; }
+  .reminder-add-row .reminder-days-input { width: 150px; }
   .subtask-add { display: flex; gap: 6px; }
   .btn-sub-add:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn-sub-add:disabled:hover { background: none; color: var(--accent); }
@@ -2650,6 +2819,7 @@ const CSS = `
   .modal-desc { font-size: 13.5px; color: var(--muted); margin: -8px 0 16px; }
   .new-reminder-row { display: flex; gap: 8px; margin-bottom: 14px; }
   .new-reminder-row .reminder-days-input { flex-shrink: 0; width: 130px; margin-bottom: 0; }
+  .new-reminder-row input[type="datetime-local"].reminder-days-input { width: 190px; }
   .new-reminder-row .modal-input { margin-bottom: 0; }
   .settings-row {
     display: flex; align-items: center; justify-content: space-between;
