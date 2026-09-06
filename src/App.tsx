@@ -4,6 +4,7 @@ import { Network } from "@capacitor/network";
 import {
   LocalNotifications,
   type PermissionStatus,
+  type SettingsPermissionStatus,
 } from "@capacitor/local-notifications";
 import { API } from "./config";
 import { ContextMenu } from "./components/ContextMenu";
@@ -136,6 +137,7 @@ async function scheduleAllReminders(todos: Todo[], settings: AppSettings) {
     title: string;
     body: string;
     schedule: { at: Date };
+    channelId: string;
   }[] = [];
 
   for (const todo of todos) {
@@ -191,6 +193,7 @@ async function scheduleAllReminders(todos: Todo[], settings: AppSettings) {
         title,
         body: template.replace("{task}", todo.task).replace("{when}", when),
         schedule: { at: notifyAt },
+        channelId: "reminders",
       });
     }
   }
@@ -434,6 +437,11 @@ export default function App({
   });
   const [notifPermission, setNotifPermission] =
     useState<PermissionStatus["display"]>("prompt");
+  // Android 12+ requires separately opting in to *exact* alarms (a system
+  // "Alarms & reminders" toggle) — without it, reminders still fire but the
+  // OS is free to delay/batch them instead of showing them right on time.
+  const [exactAlarmPermission, setExactAlarmPermission] =
+    useState<SettingsPermissionStatus["exact_alarm"]>("prompt");
 
   // ── Data ──────────────────────────────────────────────────────────────────
 
@@ -536,18 +544,49 @@ export default function App({
   useEffect(() => {
     (async () => {
       try {
+        // The plugin's default channel uses Android's IMPORTANCE_DEFAULT,
+        // which only shows in the notification shade — it takes at least
+        // IMPORTANCE_HIGH on the channel for a notification to actually pop
+        // up on screen (a "heads-up" notification). Every scheduled
+        // notification below targets this channel via channelId.
+        await LocalNotifications.createChannel({
+          id: "reminders",
+          name: "Task reminders",
+          description: "Reminders for tasks that are due",
+          importance: 5,
+          visibility: 1,
+          vibration: true,
+        });
+
         const status = await LocalNotifications.checkPermissions();
         if (status.display === "granted" || status.display === "denied") {
           setNotifPermission(status.display);
-          return;
+        } else {
+          const req = await LocalNotifications.requestPermissions();
+          setNotifPermission(req.display);
         }
-        const req = await LocalNotifications.requestPermissions();
-        setNotifPermission(req.display);
+
+        const exact = await LocalNotifications.checkExactNotificationSetting();
+        setExactAlarmPermission(exact.exact_alarm);
       } catch {
         // not running under Capacitor (e.g. plain browser dev) — skip silently
       }
     })();
   }, []);
+
+  // Opens Android's system "Alarms & reminders" screen for this app. Per the
+  // plugin, granting/revoking this restarts the app and clears any
+  // already-scheduled exact alarms — the reminder-scheduling effect below
+  // re-registers everything on the resulting remount, so nothing extra is
+  // needed here beyond refreshing the permission state itself.
+  const enableExactAlarms = async () => {
+    try {
+      const result = await LocalNotifications.changeExactNotificationSetting();
+      setExactAlarmPermission(result.exact_alarm);
+    } catch {
+      // not running under Capacitor — nothing to do
+    }
+  };
 
   useEffect(() => {
     if (notifPermission !== "granted") return;
@@ -1745,6 +1784,19 @@ export default function App({
             <div className="refresh-bar">Syncing {queue.length} change(s)…</div>
           )}
 
+          {notifPermission === "granted" &&
+            exactAlarmPermission !== "granted" && (
+              <div className="offline-bar exact-alarm-bar">
+                <span>
+                  ⏰ Reminders may arrive late — enable exact alarms for
+                  on-time notifications
+                </span>
+                <button className="btn-inline-link" onClick={enableExactAlarms}>
+                  Enable
+                </button>
+              </div>
+            )}
+
           {/* Mobile category bar */}
           <div className="mobile-topbar">
           <div className="mobile-cats">
@@ -2655,6 +2707,15 @@ const CSS = `
     text-align: center; padding: 8px; background: var(--bg);
     border: 1px dashed var(--border);
     color: var(--muted); border-radius: 8px; margin-bottom: 16px; font-size: 13px;
+  }
+  .exact-alarm-bar {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    flex-wrap: wrap; background: var(--fav-light); border: 1px dashed var(--fav); color: var(--text);
+  }
+  .btn-inline-link {
+    background: none; border: none; color: var(--accent); font-weight: 600;
+    font-family: var(--font-body); font-size: 13px; cursor: pointer; text-decoration: underline;
+    padding: 0;
   }
   .mobile-topbar { display: none; align-items: center; gap: 8px; margin-bottom: 20px; }
   .mobile-cats { display: none; gap: 8px; overflow-x: auto; padding-bottom: 4px; scrollbar-width: none; flex: 1; min-width: 0; }
