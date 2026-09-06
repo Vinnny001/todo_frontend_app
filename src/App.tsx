@@ -365,6 +365,26 @@ export default function App({
 
   // Todo expand
   const [expandedTodos, setExpandedTodos] = useState<Set<number>>(new Set());
+  // Sub-lists (subtasks/reminders) only get their own expand/collapse once
+  // there's more than one item — with 0 or 1, there's nothing to hide.
+  const [expandedSubtaskLists, setExpandedSubtaskLists] = useState<
+    Set<number>
+  >(new Set());
+  const [expandedReminderLists, setExpandedReminderLists] = useState<
+    Set<number>
+  >(new Set());
+  const toggleSubtaskList = (todoId: number) =>
+    setExpandedSubtaskLists((s) => {
+      const n = new Set(s);
+      n.has(todoId) ? n.delete(todoId) : n.add(todoId);
+      return n;
+    });
+  const toggleReminderList = (todoId: number) =>
+    setExpandedReminderLists((s) => {
+      const n = new Set(s);
+      n.has(todoId) ? n.delete(todoId) : n.add(todoId);
+      return n;
+    });
   const [subtaskInput, setSubtaskInput] = useState<{ [id: number]: string }>(
     {},
   );
@@ -2086,7 +2106,11 @@ export default function App({
                             <li className="sub-empty">No subtasks</li>
                           )}
 
-                          {todo.subtasks.map((s) => (
+                          {(todo.subtasks.length > 1 &&
+                          !expandedSubtaskLists.has(todo.id)
+                            ? todo.subtasks.slice(0, 1)
+                            : todo.subtasks
+                          ).map((s) => (
                             <li key={s.id} className="subtask-item">
                               <button
                                 className={`check-btn small${s.completed ? " checked" : ""}`}
@@ -2112,6 +2136,17 @@ export default function App({
                             </li>
                           ))}
                         </ul>
+
+                        {todo.subtasks.length > 1 && (
+                          <button
+                            className="sublist-toggle"
+                            onClick={() => toggleSubtaskList(todo.id)}
+                          >
+                            {expandedSubtaskLists.has(todo.id)
+                              ? "Show less ▲"
+                              : `Show ${todo.subtasks.length - 1} more ▾`}
+                          </button>
+                        )}
 
                         <div className="subtask-add">
                           <input
@@ -2157,7 +2192,11 @@ export default function App({
                               <li className="sub-empty">No reminders</li>
                             )}
 
-                            {todo.reminders.map((r) => (
+                            {(todo.reminders.length > 1 &&
+                            !expandedReminderLists.has(todo.id)
+                              ? todo.reminders.slice(0, 1)
+                              : todo.reminders
+                            ).map((r) => (
                               <li key={r.id} className="reminder-item">
                                 <button
                                   className={`check-btn small${r.enabled ? " checked" : ""}`}
@@ -2205,6 +2244,17 @@ export default function App({
                               </li>
                             ))}
                           </ul>
+
+                          {todo.reminders.length > 1 && (
+                            <button
+                              className="sublist-toggle"
+                              onClick={() => toggleReminderList(todo.id)}
+                            >
+                              {expandedReminderLists.has(todo.id)
+                                ? "Show less ▲"
+                                : `Show ${todo.reminders.length - 1} more ▾`}
+                            </button>
+                          )}
 
                           <div className="subtask-add reminder-add">
                             {todo.dueDate && (
@@ -2744,6 +2794,12 @@ const CSS = `
   /* Subtasks */
   .subtask-list { list-style: none; display: flex; flex-direction: column; gap: 5px; margin-bottom: 8px; }
   .sub-empty { font-size: 12px; color: var(--muted); font-style: italic; }
+  .sublist-toggle {
+    display: block; background: none; border: none; cursor: pointer;
+    font-family: var(--font-body); font-size: 11.5px; color: var(--accent);
+    padding: 2px 0 8px; margin: 0;
+  }
+  .sublist-toggle:hover { text-decoration: underline; }
   .subtask-item { display: flex; align-items: center; gap: 8px; }
   .subtask-text { flex: 1; font-size: 13px; color: var(--muted); }
   .subtask-text.struck { text-decoration: line-through; }
